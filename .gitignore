@@ -40,3 +40,8 @@ report_*.txt
 .DS_Store
 Thumbs.db
 
+# Data & docs (not pushed)
+data/
+docs/
+openspec/
+agents/rsi_logic_signals_amp_timeframe_correlatio.pdf

@@ -11,8 +11,10 @@ from .feature_engineering_agent import FeatureEngineeringAgent
 from .regime_agent import RegimeAgent
 from .forecast_agent import ForecastAgent
 from .risk_agent import RiskAgent
-from .backtest_agent import BacktestAgent
 from .supervisor_agent import SupervisorAgent
+from .memory_agent import MemoryAgent
+from .fundamental_agent import FundamentalAnalysisAgent
+from .macro_agent import MacroAnalysisAgent
 
 __all__ = [
     'HistoricalAnalysisAgent',
@@ -24,6 +26,8 @@ __all__ = [
     'RegimeAgent',
     'ForecastAgent',
     'RiskAgent',
-    'BacktestAgent',
-    'SupervisorAgent'
+    'SupervisorAgent',
+    'MemoryAgent',
+    'FundamentalAnalysisAgent',
+    'MacroAnalysisAgent',
 ]

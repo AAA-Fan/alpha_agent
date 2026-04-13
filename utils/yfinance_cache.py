@@ -91,7 +91,7 @@ def _normalize_intraday_interval(interval: str) -> str:
 
 def _throttle_requests() -> None:
     """Best-effort rate limiting to respect Alpha Vantage quotas."""
-    limit = int(os.getenv("ALPHAVANTAGE_RATE_LIMIT_PER_MIN", "5"))
+    limit = int(os.getenv("ALPHAVANTAGE_RATE_LIMIT_PER_MIN", "75"))
     if limit <= 0:
         return
     min_interval = 60.0 / float(limit)
@@ -104,12 +104,13 @@ def _throttle_requests() -> None:
         _last_request_ts = time.time()
 
 
-def _fetch_alpha_series(symbol: str, interval: str) -> pd.DataFrame:
+def _fetch_alpha_series(symbol: str, interval: str, outputsize: str = "compact") -> pd.DataFrame:
     """Retrieve a time series from Alpha Vantage and normalize the response."""
     _throttle_requests()
     params = {
         "function": _ALPHA_PERIOD_FUNCTION[interval],
         "symbol": symbol.upper(),
+        "outputsize": outputsize,
         "apikey": _get_api_key(),
         "datatype": "csv",
     }
@@ -195,7 +196,12 @@ def _fetch_alpha_intraday(symbol: str, interval: str, outputsize: str = "compact
     return normalized
 
 
-def get_historical_data(symbol: str, interval: str = "daily", days: int | None = None) -> pd.DataFrame:
+def get_historical_data(
+    symbol: str,
+    interval: str = "daily",
+    days: int | None = None,
+    outputsize: str = "compact",
+) -> pd.DataFrame:
     """
     Cached wrapper around Alpha Vantage TIME_SERIES_* endpoints.
 
@@ -203,13 +209,14 @@ def get_historical_data(symbol: str, interval: str = "daily", days: int | None =
         symbol: Equity ticker symbol.
         interval: One of ``daily``, ``weekly``, ``monthly`` (aliases supported).
         days: Optional number of most recent rows to return (useful for daily analysis).
+        outputsize: ``compact`` (100 rows) or ``full`` (20+ years). Default ``compact``.
     """
     normalized_interval = _normalize_interval(interval)
-    key = (symbol.upper(), normalized_interval)
+    key = (symbol.upper(), normalized_interval, outputsize)
     with _download_lock:
         cached = _download_cache.get(key)
     if cached is None:
-        data = _fetch_alpha_series(symbol, normalized_interval)
+        data = _fetch_alpha_series(symbol, normalized_interval, outputsize=outputsize)
         with _download_lock:
             _download_cache[key] = data
     else:

@@ -1,411 +1,510 @@
-# Multi-Agent Financial Advisory System
+<p align="center">
+  <img src="https://img.shields.io/badge/FinanciAlAgent-Quantitative_Multi--Agent_System-blue?style=for-the-badge&logo=python&logoColor=white" alt="FinanciAlAgent"/>
+</p>
 
-A sophisticated financial advisory system built with LangChain that uses multiple AI agents to analyze stocks and provide investment recommendations.
+<div align="center">
 
-Full HTML documentation is available at `APP_DOCUMENTATION.html`.
+![Python](https://img.shields.io/badge/Python-3.8+-3776AB?logo=python&logoColor=white)
+![LangChain](https://img.shields.io/badge/LangChain-Orchestration-1C3C3C?logo=chainlink&logoColor=white)
+![LightGBM](https://img.shields.io/badge/LightGBM-Forecast-green?logo=microsoft&logoColor=white)
+![License](https://img.shields.io/badge/License-Research-orange)
 
-## System Architecture
+**A precision-engineered multi-agent financial advisory system that fuses LLM reasoning with quantitative ML models for institutional-grade stock analysis.**
 
-The system consists of specialized agents:
+[Architecture](#architecture) · [Quant Pipeline](#-the-quantitative-pipeline-what-sets-us-apart) · [Quick Start](#-quick-start) · [Backtest](#-backtest-engine) · [API & Dashboard](#-api--dashboard) · [Configuration](#-configuration)
 
-1. **Historical Data Analysis Agent**: Fetches and analyzes historical stock data (1 week) including price trends, volatility, and volume patterns.
+</div>
 
-2. **Indicator Analysis Agent**: Computes RSI signals across multiple timeframes and produces momentum-based buy/sell/hold signals.
+---
 
-3. **News Sentiment Analysis Agent**: Fetches the latest news from the internet and performs sentiment analysis to identify positive and negative factors affecting the stock.
+## Why FinanciAlAgent?
 
-4. **Pair Ledger Agent**: Builds and persists momentum-similar stock pairs from a defined universe (default: top 100 S&P 500 by weight).
+Most LLM-based trading frameworks treat the market as a **text comprehension problem** — feeding news and financials into language models and hoping for good decisions. FinanciAlAgent takes a fundamentally different approach:
 
-5. **Pair Monitor Agent**: Monitors those pairs for short-term momentum divergence and flags leading/lagging moves.
+> **LLMs handle what they're good at (reasoning, synthesis, review). ML models handle what they're good at (pattern recognition, probability estimation). Neither substitutes for the other.**
 
-6. **Feature Engineering Agent**: Builds quantitative features (momentum, volatility, RSI, MACD, volume pressure, drawdown).
+| Capability | Typical LLM Trading Framework | FinanciAlAgent |
+|:---|:---|:---|
+| Forecast Method | LLM text reasoning | **LightGBM probabilistic model** with Isotonic calibration |
+| Uncertainty Quantification | ❌ None | ✅ **Conformal prediction sets** + tree dispersion |
+| Position Sizing | Fixed or LLM-suggested | **Prediction-Kelly criterion** (continuous, probability-scaled) |
+| Regime Awareness | ❌ or basic | **3D regime classifier** (Trend × Volatility × Momentum) + Markov smoothing |
+| Risk Control | LLM-generated advice | **Algorithmic**: signal alignment, dynamic stops, uncertainty gates |
+| Self-Calibration | ❌ None | ✅ **Memory Agent** tracks prediction accuracy → adjusts position sizing |
+| Validation | Manual inspection | **4-stage ablation backtest** with walk-forward engine |
+| Reflection | ❌ None | ✅ **Reviewer Agent** critiques draft → Supervisor revises |
 
-7. **Regime Agent**: Classifies trend/volatility regime to contextualize signals (e.g., trending_up, choppy_high_vol).
+---
 
-8. **Forecast Agent**: Produces probabilistic forecasts with confidence intervals. Uses trained config if present, otherwise heuristic fallback.
+## Architecture
 
-9. **Risk Agent**: Converts forecast + regime into position sizing, stop/take-profit, and risk flags.
+FinanciAlAgent decomposes financial analysis into **15 specialized agents** organized in a **layered dependency graph** with parallel execution:
 
-10. **Backtest Agent**: Runs a walk-forward strategy snapshot for sanity-checking recent behavior.
-
-11. **Supervisor Agent**: Coordinates all agents, synthesizes qualitative + quantitative outputs, and provides final investment recommendations.
-
-## Features
-
-- **Multi-Agent Architecture**: Specialized agents working in parallel
-- **Historical Analysis**: Technical analysis of stock price movements and trends
-- **News Sentiment**: Real-time news fetching and sentiment analysis
-- **Intelligent Recommendations**: AI-powered synthesis and investment advice
-- **Pair Momentum Monitoring**: Detects divergence across momentum-similar stock pairs
-- **Probabilistic Forecasting**: Model-ready forecast layer with confidence intervals
-- **Risk-Aware Guidance**: Position sizing and guardrails based on volatility and confidence
-- **Backtest Snapshot**: Lightweight strategy check on recent history
-- **Comprehensive Reports**: Detailed reports saved to files
-
-## Installation
-
-### Prerequisites
-
-- Python 3.8 or higher
-- OpenAI API key
-- Alpha Vantage API key (for historical price/indicator data)
-- (Optional) Tavily API key for enhanced news search
-
-### Setup
-
-1. Clone or navigate to the project directory:
-```bash
-cd financailagent
+```
+                          ┌─────────────────────────────────────────────┐
+                          │              Layer 0 (Parallel)             │
+                          │                                             │
+                          │  ┌──────────┐ ┌──────────┐ ┌────────────┐  │
+                          │  │Historical│ │Indicator │ │   News     │  │
+                          │  │  Agent   │ │  Agent   │ │ Sentiment  │  │
+                          │  └──────────┘ └──────────┘ └────────────┘  │
+                          │  ┌──────────┐ ┌──────────┐ ┌────────────┐  │
+                          │  │ Feature  │ │Fundament.│ │   Macro    │  │
+                          │  │ Engineer │ │  Agent   │ │   Agent    │  │
+                          │  └────┬─────┘ └──────────┘ └────────────┘  │
+                          │  ┌────┴─────┐ ┌──────────┐                 │
+                          │  │  Pair    │ │  Macro   │                 │
+                          │  │ Ledger   │ │Fund.Feat.│                 │
+                          │  └────┬─────┘ └────┬─────┘                 │
+                          └───────┼────────────┼───────────────────────┘
+                                  │            │
+                          ┌───────┼────────────┼───────────────────────┐
+                          │       │  Layer 1   │                       │
+                          │  ┌────┴─────┐ ┌────┴─────┐                 │
+                          │  │  Pair    │ │  Regime  │                 │
+                          │  │ Monitor  │ │  Agent   │                 │
+                          │  └──────────┘ └────┬─────┘                 │
+                          └────────────────────┼───────────────────────┘
+                                               │
+                          ┌────────────────────┼───────────────────────┐
+                          │       Layer 2      │                       │
+                          │              ┌─────┴─────┐                 │
+                          │              │ Forecast  │                 │
+                          │              │   Agent   │                 │
+                          │              └─────┬─────┘                 │
+                          └────────────────────┼───────────────────────┘
+                                               │
+                          ┌────────────────────┼───────────────────────┐
+                          │       Layer 3      │                       │
+                          │              ┌─────┴─────┐                 │
+                          │              │   Risk    │                 │
+                          │              │   Agent   │                 │
+                          │              └─────┬─────┘                 │
+                          └────────────────────┼───────────────────────┘
+                                               │
+                          ┌────────────────────┼───────────────────────┐
+                          │       Layer 4      │                       │
+                          │  ┌─────────────────┴──────────────────┐    │
+                          │  │         Supervisor Agent           │    │
+                          │  │  (Synthesize all agent outputs)    │    │
+                          │  └─────────────────┬──────────────────┘    │
+                          │                    │                       │
+                          │  ┌─────────────────┴──────────────────┐    │
+                          │  │         Reviewer Agent             │    │
+                          │  │  (Critique → Revise if needed)     │    │
+                          │  └────────────────────────────────────┘    │
+                          └────────────────────────────────────────────┘
 ```
 
-2. Install dependencies:
+**Key design principle**: Each layer only depends on the layers above it. Layer 0 agents run **fully in parallel**, minimizing wall-clock time.
+
+---
+
+## 🔬 The Quantitative Pipeline (What Sets Us Apart)
+
+This is where FinanciAlAgent diverges from text-only frameworks. The quant pipeline is a **4-stage chain** where each stage adds measurable alpha, validated through ablation testing:
+
+### Stage 1: Feature Engineering Agent
+
+Computes **15+ ML-ready features** from raw OHLCV data:
+
+| Category | Features |
+|:---|:---|
+| Momentum | 5d/10d/20d returns, MACD signal, RSI |
+| Volatility | 20d realized vol, Bollinger bandwidth, ATR ratio |
+| Volume | Volume pressure (OBV slope), volume ratio |
+| Trend | SMA cross signals, drawdown from high |
+| Macro/Fundamental | VIX, yield curve, financial health score, debt-to-equity (24 features) |
+
+### Stage 2: Regime Agent — 3D Market Classifier
+
+Our Regime Agent classifies markets across **three independent dimensions**:
+
+```
+Dimension 1: Trend          → strong_uptrend | uptrend | neutral | downtrend | strong_downtrend
+Dimension 2: Volatility     → low | normal | high | extreme  (+ expansion flag)
+Dimension 3: Momentum Health → accelerating | steady | decelerating | exhausted
+```
+
+These combine into **9 actionable composite regimes**: `strong_rally`, `trending_up`, `topping_out`, `range_bound`, `coiling`, `choppy`, `trending_down`, `bottoming_out`, `capitulation`.
+
+**Advanced features**:
+- **Markov transition smoothing** — Uses a learned transition probability matrix to suppress impossible regime jumps (e.g., `strong_rally` → `capitulation` in one step)
+- **Regime features feed into LightGBM** — Compressed ordinal encoding (direction + volatility ordinal + momentum health) as model input features, not just labels
+- **Optional Dimension 4: Macro Regime** — `risk_on` / `neutral` / `risk_off` derived from VIX, yield curve, SPY momentum
+
+### Stage 3: Forecast Agent — Probabilistic ML Predictions
+
+The Forecast Agent is **not an LLM** — it's a trained **LightGBM binary classifier** with rigorous statistical calibration
+
+**Why this matters**:
+- **Conformal prediction** provides distribution-free coverage guarantees — if the prediction set contains both `{up, down}`, the model is genuinely uncertain and the Risk Agent **rejects the trade**
+- **Isotonic calibration** ensures that when the model says "70% probability up", it actually goes up ~70% of the time
+- **Tree dispersion** (variance across LightGBM trees) provides a second, independent uncertainty signal
+- **3-tier fallback**: LightGBM → Ridge regression → hand-tuned heuristic, ensuring the system never crashes
+
+### Stage 4: Risk Agent — Algorithmic Position Sizing
+
+The Risk Agent converts probabilistic forecasts into executable risk plans through a **multi-gate pipeline**:
+
+```
+Gate ①  Signal Alignment    — Regime vs Forecast direction conflict check
+        ↳ alignment < 0.4 → reject (unless high-confidence override: |prob - 0.5| > 0.35)
+
+Gate ②  Prediction-Kelly    — Position size = f(predicted probability, historical win/loss ratio)
+        ↳ Scales continuously with signal strength (not fixed lots)
+
+Gate ③  Uncertainty Gates   — Conformal set = {up,down} → reject
+                             — Tree dispersion > 0.15 → halve position
+
+Gate ④  Direction & Sizing  — Apply direction sign, enforce max position
+
+Gate ⑤  Track Record Factor — Memory Agent accuracy → scale position [0.3, 1.1]
+
+Gate ⑥  Min Position Filter — |position| < 3% → reject (not worth execution cost)
+
+Gate ⑦  Dynamic Stop-Loss   — 2.5× daily volatility, clamped to [1%, 8%]
+        ↳ Take-profit = stop-loss × risk-reward ratio (default 2:1)
+```
+
+**Every gate is ablation-tested** — we verified each component's marginal contribution through our 4-stage debug framework.
+
+---
+
+## 🧠 LLM-Powered Qualitative Agents
+
+While the quant pipeline handles numbers, LLM agents handle **context, reasoning, and synthesis**:
+
+### Analyst Layer
+
+| Agent | Role | Data Source |
+|:---|:---|:---|
+| **Historical Agent** | Price trend analysis, support/resistance, volume patterns | Alpha Vantage |
+| **Indicator Agent** | Multi-timeframe RSI signals, divergence detection, channel regimes | Alpha Vantage |
+| **News Sentiment Agent** | Real-time news sentiment scoring with impact assessment | DuckDuckGo + Tavily |
+| **Fundamental Agent** | Financial health, valuation metrics, earnings analysis | Alpha Vantage |
+| **Macro Agent** | Macroeconomic environment, Fed policy, sector rotation | Alpha Vantage |
+
+### Pair Monitoring System
+
+| Agent | Role |
+|:---|:---|
+| **Pair Ledger Agent** | Builds persistent momentum-similar stock pairs (top 100 S&P 500, correlation > 0.85) |
+| **Pair Monitor Agent** | Detects spread z-score divergence → flags leading/lagging moves |
+
+### Synthesis & Review
+
+| Agent | Role |
+|:---|:---|
+| **Supervisor Agent** | Synthesizes all 13 agent outputs into a final BUY/SELL/HOLD recommendation |
+| **Reviewer Agent** | **Reflection loop** — critiques the draft for overlooked risks, logic gaps, confidence miscalibration |
+| **Memory Agent** | Tracks historical prediction accuracy → feeds back into position sizing |
+
+> The **Reflection Loop** is a key differentiator: the Reviewer Agent acts as a risk-control officer, cross-checking the Supervisor's draft against raw agent data. If issues are found, the Supervisor **revises** the recommendation before output.
+
+---
+
+## 📊 Backtest Engine
+
+FinanciAlAgent includes a production-grade **Agent-in-the-Loop walk-forward backtest engine**:
+
 ```bash
+python scripts/run_backtest.py --ticker AAPL --start 2023-01-01 --end 2025-12-31
+```
+
+**Execution model**: Signal at Close → Execute at Next Open (realistic, no lookahead).
+
+### Evaluation Metrics (17+ indicators)
+
+| Category | Metrics |
+|:---|:---|
+| Returns | Total return, Alpha (vs buy-and-hold), Avg trade return |
+| Risk-Adjusted | Sharpe ratio, Sortino ratio, Profit factor |
+| Drawdown | Max drawdown, drawdown duration |
+| Signal Quality | Hit rate, Trade IC, N trades (buy/sell breakdown) |
+| Exit Analysis | Stop-loss / Take-profit / Horizon exit rates and avg returns |
+| Per-Regime | Breakdown by regime state (hit rate, contribution, avg return) |
+
+### 4-Stage Ablation Debug Framework
+
+We provide a **systematic debug toolkit** to validate each agent's marginal contribution:
+
+```
+Stage 0: Signal IC           — Raw feature predictive power (no agents)
+Stage 1: Forecast Only       — LightGBM predictions, threshold sweep
+Stage 2: Forecast + Risk     — Add position sizing, stops, uncertainty gates
+Stage 3: + Regime Agent      — Add regime features, signal alignment, ablation variants
+```
+
+```bash
+# Example: Stage 3 ablation with multiple variants
+python scripts/debug_stage3_regime.py \
+  --ticker AAPL \
+  --start 2023-01-01 \
+  --end 2025-12-31 \
+  --rounds v0,v1,v1b,v1b_C
+```
+
+### Sample Backtest Results (AAPL, 2023-01-01 → 2025-12-31)
+
+| Metric | Value |
+|:---|:---|
+| Total Return | **+87.56%** |
+| Alpha (vs Buy & Hold) | **+8.49%** |
+| Sharpe Ratio | 1.20 |
+| Sortino Ratio | 2.54 |
+| Max Drawdown | -13.53% |
+| Hit Rate | 54.93% |
+| Total Trades | 142 |
+
+> ⚠️ *Backtest results are for research validation only. Past performance does not guarantee future results.*
+
+---
+
+## 🚀 Quick Start
+
+### Installation
+
+```bash
+git clone <your-repo-url>
+cd financailagent
+
+# Create environment
+conda create -n financailagent python=3.10
+conda activate financailagent
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-3. Set up environment variables:
+### Required API Keys
+
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and add your OpenAI API key:
-```
-OPENAI_API_KEY=your_openai_api_key_here
-```
+Edit `.env` with your keys:
 
-For enhanced news search, you can optionally add:
-```
-TAVILY_API_KEY=your_tavily_api_key_here
-```
-
-For market data, add Alpha Vantage API key:
-```
-ALPHAVANTAGE_API_KEY=your_alpha_vantage_api_key_here
-```
-
-## Usage
-
-### Basic Usage
-
-Run the main script:
 ```bash
-python main.py
+OPENAI_API_KEY=your_openai_key          # Required: LLM reasoning
+ALPHAVANTAGE_API_KEY=your_av_key        # Required: Market data
+TAVILY_API_KEY=your_tavily_key          # Optional: Enhanced news search
 ```
 
-Enter a stock symbol when prompted (e.g., AAPL, GOOGL, MSFT, TSLA).
+### Run Analysis
 
-### Dynamic Frontend Dashboard
+```bash
+# Interactive CLI
+python main.py
 
-Launch the real-time frontend:
+# Programmatic usage
+python example_usage.py
+```
+
+### Train the Forecast Model
+
+```bash
+# Train LightGBM on S&P 500 top 100 stocks with Purged K-Fold CV
+python pipelines/train_forecast_model.py
+```
+
+### Python API
+
+```python
+from agents import (
+    FeatureEngineeringAgent, RegimeAgent, ForecastAgent,
+    RiskAgent, SupervisorAgent, MemoryAgent,
+)
+
+# Quantitative pipeline (no LLM needed)
+feature_agent = FeatureEngineeringAgent()
+regime_agent = RegimeAgent()
+forecast_agent = ForecastAgent()
+risk_agent = RiskAgent()
+
+# Run the quant chain
+features = feature_agent.analyze("AAPL")
+regime = regime_agent.analyze("AAPL", features)
+forecast = forecast_agent.analyze("AAPL", features, regime)
+risk = risk_agent.analyze("AAPL", forecast, regime, features)
+
+print(f"Action: {forecast['forecast']['action']}")
+print(f"P(up): {forecast['forecast']['probability_up']:.3f}")
+print(f"Position: {risk['risk_plan']['position_size_fraction']:.3f}")
+print(f"Stop-loss: {risk['risk_plan']['stop_loss_pct']:.3f}")
+```
+
+---
+
+## 🖥 API & Dashboard
+
+### Streamlit Dashboard
 
 ```bash
 streamlit run dashboard.py
 ```
 
-The dashboard includes:
-- **Live Analysis**: Run the full 10-step pipeline with live progress logs
-- **Monitoring**: Track stored recommendations, predictions, pair signals, and realized outcomes
-- **Configuration**: See current runtime/model/storage state
-
-Use sidebar controls to filter by symbol and enable auto-refresh monitoring.
+Features:
+- **Live Analysis** — Full 15-agent pipeline with real-time progress
+- **Monitoring** — Track recommendations, predictions, pair signals, realized outcomes
+- **Configuration** — Runtime/model/storage state overview
 
 ### FastAPI Backend
-
-Run API server:
 
 ```bash
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
-Core endpoints:
-- `GET /health`
-- `POST /analyze`
-- `GET /storage/status`
-- `GET /storage/summary`
-- `GET /storage/recommendations`
-- `GET /storage/predictions`
-- `GET /storage/pair-signals`
-- `GET /storage/realized-outcomes`
-
-Example request:
+| Endpoint | Method | Description |
+|:---|:---|:---|
+| `/health` | GET | Health check |
+| `/analyze` | POST | Run full analysis pipeline |
+| `/storage/recommendations` | GET | Historical recommendations |
+| `/storage/predictions` | GET | Prediction history |
+| `/storage/pair-signals` | GET | Pair divergence signals |
+| `/storage/realized-outcomes` | GET | Tracked prediction outcomes |
 
 ```bash
 curl -X POST http://localhost:8000/analyze \
   -H "Content-Type: application/json" \
-  -d '{"symbol":"AAPL","persist":true,"save_report":true,"verbose":false}'
+  -d '{"symbol":"AAPL","persist":true,"save_report":true}'
 ```
 
-Dashboard API mode:
-- Toggle `Use API backend` in sidebar.
-- Set API base URL (default: `http://localhost:8000`).
-- In this mode, both live analysis and monitoring read/write via API.
+---
 
-### Programmatic Usage
+## ⚙ Configuration
 
-You can also use the agents programmatically:
+### Core Settings
 
-```python
-from dotenv import load_dotenv
-import os
-from langchain_openai import ChatOpenAI
-from agents import (
-    HistoricalAnalysisAgent,
-    IndicatorAnalysisAgent,
-    FeatureEngineeringAgent,
-    RegimeAgent,
-    ForecastAgent,
-    RiskAgent,
-    BacktestAgent,
-    PairLedgerAgent,
-    PairMonitorAgent,
-    NewsSentimentAgent,
-    SupervisorAgent,
-)
+| Variable | Default | Description |
+|:---|:---|:---|
+| `OPENAI_MODEL` | `gpt-4o` | LLM model for qualitative agents |
+| `OPENAI_TEMPERATURE` | `0.3` | LLM temperature |
+| `FORECAST_MODEL_PATH` | `data/forecast_model.json` | Trained model path |
+| `FORECAST_HORIZON_DAYS` | `5` | Prediction horizon |
+| `FORECAST_BUY_THRESHOLD` | `0.55` | P(up) threshold for buy signal |
+| `FORECAST_SELL_THRESHOLD` | `0.45` | P(up) threshold for sell signal |
+| `FORECAST_MODEL_VERSION` | `v1` | `v1` (single-stock) or `v2` (cross-sectional) |
 
-load_dotenv()
-llm = ChatOpenAI(model="gpt-4-turbo-preview", temperature=0.3)
+### Regime Settings
 
-# Initialize agents
-historical_agent = HistoricalAnalysisAgent(llm)
-indicator_agent = IndicatorAnalysisAgent(llm)
-news_agent = NewsSentimentAgent(llm)
-feature_agent = FeatureEngineeringAgent()
-regime_agent = RegimeAgent()
-forecast_agent = ForecastAgent()
-risk_agent = RiskAgent()
-backtest_agent = BacktestAgent()
-ledger_agent = PairLedgerAgent()
-pair_monitor_agent = PairMonitorAgent()
-supervisor_agent = SupervisorAgent(llm)
+| Variable | Default | Description |
+|:---|:---|:---|
+| `REGIME_HIGH_VOL_THRESHOLD` | `0.35` | High volatility boundary |
+| `REGIME_LOW_VOL_THRESHOLD` | `0.16` | Low volatility boundary |
+| `REGIME_EXTREME_VOL_THRESHOLD` | `0.50` | Extreme volatility boundary |
+| `REGIME_TRANSITION_MATRIX_PATH` | `data/regime_transition_matrix.json` | Markov transition matrix |
 
-# Analyze a stock
-stock_symbol = "AAPL"
+### Risk Settings
 
-pair_ledger = ledger_agent.analyze()
+| Variable | Default | Description |
+|:---|:---|:---|
+| `RISK_TARGET_ANNUAL_VOL` | `0.12` | Target annual volatility |
+| `RISK_MAX_POSITION_SIZE` | `1.0` | Maximum position fraction |
+| `RISK_REWARD_RATIO` | `2.0` | Take-profit / stop-loss ratio |
 
-historical_result = historical_agent.analyze(stock_symbol)
-indicator_result = indicator_agent.analyze(stock_symbol)
-news_result = news_agent.analyze(stock_symbol)
-pair_monitor_result = pair_monitor_agent.analyze(
-    pair_ledger.get("pairs", []),
-    focus_symbol=stock_symbol,
-)
-feature_result = feature_agent.analyze(stock_symbol)
-regime_result = regime_agent.analyze(stock_symbol, feature_result)
-forecast_result = forecast_agent.analyze(stock_symbol, feature_result, regime_result)
-risk_result = risk_agent.analyze(stock_symbol, forecast_result, regime_result, feature_result)
-backtest_result = backtest_agent.analyze(stock_symbol)
-recommendation = supervisor_agent.make_recommendation(
-    historical_result,
-    indicator_result,
-    news_result,
-    pair_monitor_result,
-    stock_symbol,
-    feature_result,
-    regime_result,
-    forecast_result,
-    risk_result,
-    backtest_result,
-)
+### Pair Monitoring
 
-print(supervisor_agent.format_final_report(recommendation))
+| Variable | Default | Description |
+|:---|:---|:---|
+| `PAIR_UNIVERSE_PATH` | `data/sp500_top100.json` | Ticker universe |
+| `PAIR_LOOKBACK_DAYS` | `90` | Correlation lookback window |
+| `PAIR_TOP_K` | `5` | Number of pairs per stock |
+| `PAIR_MIN_CORR` | `0.85` | Minimum correlation threshold |
+| `PAIR_ZSCORE_THRESHOLD` | `1.5` | Divergence detection threshold |
+
+### Storage
+
+| Variable | Default | Description |
+|:---|:---|:---|
+| `STORAGE_ENABLED` | `true` | Enable persistence |
+| `STORAGE_URL` | `sqlite:///data/agent_store.db` | Database connection string |
+
+> Supports SQLite (default) and PostgreSQL (`psycopg2-binary` required).
+
+---
+
+## 📁 Project Structure
+
+```
+financailagent/
+├── agents/                          # 15 specialized agents
+│   ├── feature_engineering_agent.py # ML feature computation
+│   ├── regime_agent.py              # 3D market regime classifier
+│   ├── forecast_agent.py            # LightGBM probabilistic forecaster
+│   ├── risk_agent.py                # Algorithmic position sizing
+│   ├── memory_agent.py              # Self-calibration from track record
+│   ├── supervisor_agent.py          # LLM synthesis & recommendation
+│   ├── reviewer_agent.py            # Reflection loop critique
+│   ├── historical_agent.py          # Price trend analysis (LLM)
+│   ├── indicator_agent.py           # Multi-TF RSI signals (LLM)
+│   ├── news_sentiment_agent.py      # News sentiment (LLM)
+│   ├── fundamental_agent.py         # Financial health (LLM)
+│   ├── macro_agent.py               # Macro environment (LLM)
+│   ├── ledger_agent.py              # Pair construction
+│   ├── pair_monitor_agent.py        # Pair divergence detection
+│   └── backtest_agent.py            # Lightweight strategy check
+├── backtest/
+│   ├── engine.py                    # Walk-forward backtest engine
+│   └── evaluator.py                 # 17+ metric evaluation suite
+├── pipelines/
+│   ├── train_forecast_model.py      # LightGBM training (Purged K-Fold)
+│   └── track_outcomes.py            # Prediction outcome tracking
+├── scripts/
+│   ├── run_backtest.py              # Production backtest runner
+│   ├── debug_stage0_signal_ic.py    # Stage 0: Signal IC analysis
+│   ├── debug_stage1_forecast_only.py# Stage 1: Forecast-only backtest
+│   ├── debug_stage2_forecast_risk.py# Stage 2: + Risk agent
+│   ├── debug_stage3_regime.py       # Stage 3: + Regime ablation
+│   └── build_regime_matrix.py       # Build transition matrix
+├── utils/
+│   ├── macro_fundamental_provider.py# Macro/fundamental feature extraction
+│   ├── cross_sectional_service.py   # Cross-sectional rank features (V2)
+│   ├── storage.py                   # SQLite/PostgreSQL persistence
+│   └── yfinance_cache.py            # Market data caching
+├── orchestrator.py                  # Pipeline orchestrator (parallel execution)
+├── main.py                          # CLI entry point
+├── api.py                           # FastAPI backend
+├── dashboard.py                     # Streamlit frontend
+└── example_usage.py                 # Quick-start example
 ```
 
-## Agent Details
+---
 
-### Historical Data Analysis Agent
+## 🔮 Roadmap
 
-- Fetches 7 days of historical stock data using Alpha Vantage
-- Calculates key metrics:
-  - Price changes and percentage changes
-  - Volatility measures
-  - Volume analysis
-  - Trend identification
-  - Support and resistance levels
-- Identifies bullish or bearish patterns
-### Indicator Analysis Agent
+- [ ] **V2 Cross-Sectional Model** — 100-stock universe with rank features and industry encoding
+- [ ] **Intraday Signals** — Sub-daily feature engineering and regime detection
+- [ ] **Portfolio-Level Optimization** — Multi-stock allocation with correlation-aware sizing
+- [ ] **Live Trading Integration** — Broker API connectivity (Alpaca, Interactive Brokers)
+- [ ] **Multi-LLM Support** — Google Gemini, Anthropic Claude, local Ollama models
 
-- Calculates RSI across daily/weekly/monthly timeframes
-- Applies RSI logic to detect divergences, reversals, and channel regimes
-- Outputs structured buy/sell/hold signals with reasoning
-
-### Pair Ledger Agent
-
-- Builds a persistent ledger of momentum-similar stock pairs
-- Uses return correlation over a configurable lookback window
-- Supports add/remove pairs via environment overrides on startup
-
-### Pair Monitor Agent
-
-- Monitors pair momentum over a short window (default: 5 trading days)
-- Uses spread z-scores to detect divergence and identify leading/lagging stocks
-- Feeds pair signals into the supervisor recommendation
-
-### Feature Engineering Agent
-
-- Computes machine-learning-ready features from OHLCV data
-- Normalizes current market state into structured numeric signals
-
-### Regime Agent
-
-- Classifies trend and volatility regimes
-- Adds market-context awareness to the forecast/risk pipeline
-
-### Forecast Agent
-
-- Produces probability-up forecast and confidence interval
-- Supports trained model config at `FORECAST_MODEL_PATH`
-- Falls back to deterministic heuristic if model config is missing
-
-### Risk Agent
-
-- Converts forecast confidence + volatility into position size guidance
-- Produces stop-loss/take-profit levels and risk flags
-
-### Backtest Agent
-
-- Runs a lightweight walk-forward simulation
-- Reports hit-rate, approximate Sharpe, max drawdown, and strategy return
-
-### News Sentiment Analysis Agent
-
-- Fetches latest news articles from multiple sources
-- Uses DuckDuckGo and Tavily search APIs
-- Performs detailed sentiment analysis:
-  - Overall sentiment classification (Positive/Negative/Neutral)
-  - Sentiment scoring
-  - Key positive and negative factors
-  - Impact assessment on stock price
-  - Market and sector considerations
-
-### Supervisor Agent
-
-- Synthesizes information from all agents
-- Identifies alignment or conflicts between technical, sentiment, and pair signals
-- Provides clear recommendations:
-  - BUY/SELL/HOLD decision
-  - Risk assessment
-  - Supporting factors
-  - Potential price targets
-  - Important caveats
-
-## Output
-
-The system generates:
-1. Console output with real-time progress
-2. Detailed final report displayed in terminal
-3. Saved report file: `report_{SYMBOL}_{TIMESTAMP}.txt`
-
-Report includes:
-- Executive summary and recommendation
-- Detailed historical analysis
-- Comprehensive news sentiment analysis
-- Quant feature/regime/forecast/risk outputs
-- Backtest snapshot metrics
-- Risk assessment and key considerations
+---
 
 ## Dependencies
 
-- **langchain**: Core framework for agent orchestration
-- **langchain-openai**: OpenAI LLM integration
-- **langchain-community**: Community tools and integrations
-- **langgraph**: Advanced multi-agent workflows
-- **Alpha Vantage (via requests)**: Stock market data
-- **duckduckgo-search**: News search
-- **tavily-python**: Enhanced news search (optional)
-- **pandas, numpy**: Data analysis
-- **beautifulsoup4, feedparser, newspaper3k**: Web scraping
+| Package | Purpose |
+|:---|:---|
+| `langchain` + `langchain-openai` | LLM orchestration |
+| `langgraph` | Multi-agent workflow |
+| `lightgbm` | Forecast model |
+| `scikit-learn` | Calibration, cross-validation |
+| `pandas` + `numpy` | Data processing |
+| `yfinance` | Market data |
+| `streamlit` + `plotly` | Dashboard |
+| `fastapi` + `uvicorn` | API server |
+| `tavily-python` + `duckduckgo-search` | News search |
 
-## Configuration
-
-You can customize the system by:
-- Adjusting LLM temperature in `main.py` (default: 0.3 for consistency)
-- Changing the number of days for historical analysis (default: 7)
-- Modifying the number of news articles fetched (default: 10)
-- Using different LLM models
-
-## Pair Monitoring Configuration
-
-Environment variables:
-
-- Default universe file `data/sp500_top100.json` is sourced from us500.com as of 2026-01-30; update it as needed for freshness.
-- `PAIR_UNIVERSE_PATH`: JSON file with tickers (default: `data/sp500_top100.json`)
-- `PAIR_UNIVERSE`: Comma-separated override list of tickers
-- `PAIR_LEDGER_PATH`: Where the ledger is stored (default: `data/pairs_ledger.json`)
-- `PAIR_LOOKBACK_DAYS`: Lookback for correlation (default: 90)
-- `PAIR_TOP_K`: Number of pairs to keep (default: 5)
-- `PAIR_MIN_CORR`: Minimum correlation for pairs (default: 0.85)
-- `PAIR_REBUILD`: Force rebuild on startup (true/false)
-- `PAIR_REFRESH_INTERVAL_HOURS`: Rebuild ledger if older than N hours (overrides refresh time)
-- `PAIR_REFRESH_UTC_HOUR`: Daily refresh hour in UTC (default: 21, ~4pm ET)
-- `PAIR_REFRESH_UTC_MINUTE`: Daily refresh minute in UTC (default: 0)
-- `PAIR_ADD`: Add pairs on startup, format `AAPL/MSFT,MSFT/NVDA`
-- `PAIR_REMOVE`: Remove pairs on startup, format `AAPL/MSFT`
-- `PAIR_MONITOR_WINDOW`: Momentum window for monitoring (default: 5)
-- `PAIR_MONITOR_INTERVAL`: Data interval for monitoring (`daily`, `5min`, `15min`, `30min`, `60min`)
-- `PAIR_ZSCORE_WINDOW`: Window for spread z-score (default: 20)
-- `PAIR_ZSCORE_THRESHOLD`: Z-score threshold for divergence (default: 1.5)
-- `PAIR_DIVERGENCE_THRESHOLD`: Backward-compatible alias for z-score threshold
-
-## Storage Configuration
-
-Environment variables:
-
-- `STORAGE_ENABLED`: Enable persistence (default: true)
-- `STORAGE_URL`: Storage connection string (default: `sqlite:///data/agent_store.db`)
-- `STORAGE_USER_ID`: Optional user identifier to tag rows
-If you want Postgres, install `psycopg2-binary` and set `STORAGE_URL` to your Postgres DSN.
-For dashboard table viewing, SQLite storage is supported directly.
-
-## API Configuration
-
-Environment variables:
-
-- `API_ALLOWED_ORIGINS`: CORS allowlist, comma-separated (default: `*`)
-- `API_BASE_URL`: Dashboard default API URL (default: `http://localhost:8000`)
-- `DASHBOARD_USE_API`: Start dashboard with API mode on/off (`true`/`false`, default: `false`)
-
-## Alpha Vantage Rate Limits & Caching
-
-Environment variables:
-
-- `ALPHAVANTAGE_RATE_LIMIT_PER_MIN`: Throttle requests per minute (default: 5)
-- `ALPHAVANTAGE_INTRADAY_TTL`: Intraday cache TTL in seconds (default: 300)
-
-## Forecast/Model Configuration
-
-Environment variables:
-
-- `FORECAST_MODEL_PATH`: Path to trained model config JSON (default: `data/forecast_model.json`)
-- `FORECAST_HORIZON_DAYS`: Forecast horizon for prediction layer (default: 5)
-- `FORECAST_BUY_THRESHOLD`: Probability threshold for buy action (default: 0.55)
-- `FORECAST_SELL_THRESHOLD`: Probability threshold for sell action (default: 0.45)
-
-Training script (builds a model config from live market history):
-
-```bash
-python pipelines/train_forecast_model.py
-```
-
-## Limitations
-
-- Requires internet connection for news fetching
-- API rate limits may apply for OpenAI and search APIs
-- Historical data depends on market hours and data availability
-- News sentiment is based on available sources and may not capture all relevant news
-- Recommendations are for informational purposes only and should not be considered as financial advice
-
-## Troubleshooting
-
-1. **API Key Errors**: Ensure your `.env` file contains a valid OpenAI API key
-2. **No News Found**: Try adding a Tavily API key for better news search results
-3. **Data Fetching Errors**: Check your internet connection and verify the stock symbol is correct
-4. **Import Errors**: Ensure all dependencies are installed: `pip install -r requirements.txt`
-
-## License
-
-This project is provided as-is for educational and research purposes.
+---
 
 ## Disclaimer
 
-This system provides AI-generated financial analysis and recommendations for informational purposes only. It should not be considered as professional financial advice. Always consult with a qualified financial advisor before making investment decisions. Past performance does not guarantee future results, and investments carry inherent risks.
+> This system is designed for **research and educational purposes only**. It is not intended as financial, investment, or trading advice. Trading performance may vary based on model configuration, data quality, market conditions, and other non-deterministic factors. Always consult with a qualified financial advisor before making investment decisions. Past performance does not guarantee future results.
+
+---
+
+<div align="center">
+
+**Built with precision. Validated with rigor. Designed for alpha.**
+
+</div>

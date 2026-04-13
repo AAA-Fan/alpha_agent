@@ -303,5 +303,36 @@ class PairLedgerAgent:
             ledger = self._apply_env_overrides(ledger)
         return ledger
 
+    def _mock_ledger(self) -> Dict[str, Any]:
+        """Return a minimal mock ledger for debug/testing purposes."""
+        self._log("[DEBUG] Returning mock pair ledger (PAIR_DEBUG_SKIP=true)")
+        return {
+            "status": "success",
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "lookback_days": self.lookback_days,
+            "universe_count": 0,
+            "pairs": [
+                {
+                    "symbol_a": "AAPL",
+                    "symbol_b": "MSFT",
+                    "similarity": 0.92,
+                    "method": "mock",
+                    "window": self.lookback_days,
+                },
+                {
+                    "symbol_a": "GOOGL",
+                    "symbol_b": "META",
+                    "similarity": 0.89,
+                    "method": "mock",
+                    "window": self.lookback_days,
+                },
+            ],
+            "errors": {},
+            "_debug": True,
+        }
+
     def analyze(self) -> Dict[str, Any]:
+        # Fast path: skip entirely in debug mode
+        if os.getenv("PAIR_DEBUG_SKIP", "false").lower() == "true":
+            return self._mock_ledger()
         return self.load_or_build_pairs()

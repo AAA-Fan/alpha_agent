@@ -191,33 +191,6 @@ def _show_forecast_gauge(probability_up: float) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _show_backtest_chart(metrics: Dict[str, Any]) -> None:
-    if not metrics:
-        st.info("Backtest metrics unavailable for the current run.")
-        return
-    chart_df = pd.DataFrame(
-        {
-            "metric": ["strategy_total_return", "buy_and_hold_return", "hit_rate", "max_drawdown"],
-            "value": [
-                metrics.get("strategy_total_return", 0.0),
-                metrics.get("buy_and_hold_return", 0.0),
-                metrics.get("hit_rate", 0.0),
-                metrics.get("max_drawdown", 0.0),
-            ],
-        }
-    )
-    fig = px.bar(
-        chart_df,
-        x="metric",
-        y="value",
-        color="value",
-        color_continuous_scale=["#dc2626", "#f59e0b", "#0f766e"],
-        title="Backtest Snapshot Metrics",
-    )
-    fig.update_layout(height=300, margin=dict(l=20, r=20, t=45, b=10), coloraxis_showscale=False)
-    st.plotly_chart(fig, use_container_width=True)
-
-
 def _analysis_panel(use_api_backend: bool, api_base_url: str) -> None:
     st.markdown("## Live Analysis")
     st.markdown(
@@ -296,20 +269,16 @@ def _analysis_panel(use_api_backend: bool, api_base_url: str) -> None:
     results = result.get("results", {})
     forecast = results.get("forecast", {}).get("forecast", {})
     risk = results.get("risk", {}).get("risk_plan", {})
-    backtest = results.get("backtest", {}).get("metrics", {})
     rec_text = results.get("recommendation", {}).get("recommendation", "")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Action", str(forecast.get("action", "n/a")).upper())
     c2.metric("Prob. Up", f"{float(forecast.get('probability_up', 0.0)):.2%}")
-    c3.metric("Predicted Return", f"{float(forecast.get('predicted_return', 0.0)):.2%}")
-    c4.metric("Position Size", f"{float(risk.get('position_size_fraction', 0.0)):.2f}")
+    c3.metric("Position Size", f"{float(risk.get('position_size_fraction', 0.0)):.2f}")
 
-    gauge_col, backtest_col = st.columns([1, 2])
+    gauge_col, _ = st.columns([1, 2])
     with gauge_col:
         _show_forecast_gauge(float(forecast.get("probability_up", 0.0)))
-    with backtest_col:
-        _show_backtest_chart(backtest)
 
     with st.expander("Final Recommendation", expanded=True):
         st.markdown(rec_text or "No recommendation text generated.")
@@ -331,8 +300,6 @@ def _analysis_panel(use_api_backend: bool, api_base_url: str) -> None:
         st.json(results.get("forecast", {}))
     with st.expander("Risk Plan"):
         st.json(results.get("risk", {}))
-    with st.expander("Backtest Snapshot"):
-        st.json(results.get("backtest", {}))
 
     with st.expander("Pipeline Logs"):
         st.code("\n".join(st.session_state.get("latest_logs", [])), language="text")
@@ -418,9 +385,9 @@ def _monitor_panel(
                 ret_fig = px.bar(
                     chart_df.tail(80),
                     x="created_at",
-                    y="predicted_return",
+                    y="probability_up",
                     color="action" if "action" in chart_df.columns else None,
-                    title="Predicted Return Timeline",
+                    title="Probability-Up by Action",
                 )
                 ret_fig.update_layout(height=280, margin=dict(l=20, r=20, t=45, b=10))
                 st.plotly_chart(ret_fig, use_container_width=True)
@@ -482,7 +449,7 @@ def _config_panel(use_api_backend: bool, api_base_url: str) -> None:
         st.write(f"Storage URL: `{storage_url}`")
         st.write(f"Use API backend: `{use_api_backend}`")
         st.write(f"API base URL: `{api_base_url}`")
-        st.write(f"OpenAI model: `{os.getenv('OPENAI_MODEL', 'gpt-4-turbo-preview')}`")
+        st.write(f"OpenAI model: `{os.getenv('OPENAI_MODEL', 'gpt-4o')}`")
         st.write(f"Verbose mode: `{os.getenv('VERBOSE', 'false')}`")
         st.write(f"Storage enabled: `{os.getenv('STORAGE_ENABLED', 'true')}`")
         st.write(f"Pair monitor interval: `{os.getenv('PAIR_MONITOR_INTERVAL', 'daily')}`")

@@ -116,14 +116,44 @@ class FeatureEngineeringAgent:
             "data_points": int(len(frame)),
             "as_of": frame.index[-1].strftime("%Y-%m-%d"),
         }
+
+        # ── Interaction / derived features ────────────────────────────────
+        # These must match the training pipeline (train_forecast_model.py)
+        m5 = latest.get("momentum_5") or 0.0
+        sma20r = latest.get("sma_20_ratio") or 0.0
+        rsi = latest.get("rsi_14") or 50.0
+        vol_z = latest.get("volume_zscore_20") or 0.0
+        dd60 = latest.get("drawdown_60") or 0.0
+        dvol20 = latest.get("daily_volatility_20") or 0.0
+
+        latest["momentum_trend_align"] = m5 * sma20r
+        latest["rsi_deviation"] = (rsi - 50.0) / 50.0
+        latest["vol_confirmed_momentum"] = m5 * max(-3.0, min(3.0, vol_z))
+        latest["mean_reversion"] = dd60 * max(-0.1, min(0.1, m5))
+        if dvol20 != 0.0:
+            latest["vol_adj_momentum_5"] = max(-5.0, min(5.0, m5 / dvol20))
+        else:
+            latest["vol_adj_momentum_5"] = 0.0
+
         return latest
 
-    def analyze(self, stock_symbol: str) -> Dict[str, Any]:
-        """Compute engineered features for a stock ticker."""
+    def analyze(self, stock_symbol: str, data_override: pd.DataFrame | None = None) -> Dict[str, Any]:
+        """Compute engineered features for a stock ticker.
+
+        Args:
+            stock_symbol: Ticker symbol.
+            data_override: If provided, use this DataFrame instead of fetching
+                           from yfinance. Enables backtest data slicing without
+                           look-ahead bias. Must have OHLCV columns with a
+                           DatetimeIndex.
+        """
         ticker = stock_symbol.upper().strip()
         try:
             self._log(f"[feature_engineering] fetching data for {ticker}")
-            data = get_historical_data(ticker, interval="daily", days=self.lookback_days + 60)
+            if data_override is not None:
+                data = data_override.copy()
+            else:
+                data = get_historical_data(ticker, interval="daily", days=self.lookback_days + 60)
             if data.empty:
                 return {
                     "agent": "feature_engineering",

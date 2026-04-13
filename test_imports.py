@@ -20,7 +20,6 @@ def test_imports():
             RegimeAgent,
             ForecastAgent,
             RiskAgent,
-            BacktestAgent,
             NewsSentimentAgent,
             SupervisorAgent,
         )
@@ -70,12 +69,11 @@ def test_agent_initialization():
             RegimeAgent,
             ForecastAgent,
             RiskAgent,
-            BacktestAgent,
             NewsSentimentAgent,
             SupervisorAgent,
         )
         
-        llm = ChatOpenAI(model="gpt-4-turbo-preview", temperature=0.3)
+        llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
         
         historical_agent = HistoricalAnalysisAgent(llm, verbose=False)
         print("✓ HistoricalAnalysisAgent initialized")
@@ -95,9 +93,6 @@ def test_agent_initialization():
         risk_agent = RiskAgent(verbose=False)
         print("✓ RiskAgent initialized")
 
-        backtest_agent = BacktestAgent(verbose=False)
-        print("✓ BacktestAgent initialized")
-        
         news_agent = NewsSentimentAgent(llm, verbose=False)
         print("✓ NewsSentimentAgent initialized")
         

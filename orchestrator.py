@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Callable, Dict
 
@@ -17,13 +18,19 @@ from agents.indicator_agent import IndicatorAnalysisAgent
 from agents.feature_engineering_agent import FeatureEngineeringAgent
 from agents.regime_agent import RegimeAgent
 from agents.forecast_agent import ForecastAgent
+from utils.cross_sectional_service import CrossSectionalFeatureService
 from agents.risk_agent import RiskAgent
-from agents.backtest_agent import BacktestAgent
 from agents.ledger_agent import PairLedgerAgent
 from agents.news_sentiment_agent import NewsSentimentAgent
 from agents.pair_monitor_agent import PairMonitorAgent
 from agents.supervisor_agent import SupervisorAgent
+from agents.reviewer_agent import ReviewerAgent
+from agents.memory_agent import MemoryAgent
+from agents.fundamental_agent import FundamentalAnalysisAgent
+from agents.macro_agent import MacroAnalysisAgent
+from utils.macro_fundamental_provider import MacroFundamentalFeatureProvider
 from utils.storage import Storage
+from pipelines.track_outcomes import track_outcomes
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -38,6 +45,50 @@ def _emit_progress(
         callback(step, total, message)
 
 
+def _safe_run(
+    agent_name: str,
+    fn: Callable[..., Dict[str, Any]],
+    *args: Any,
+    verbose: bool = False,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Safely execute an agent, returning a degraded result on failure.
+
+    This ensures that a single agent exception never crashes the entire
+    pipeline.  Downstream agents receive structurally valid (but empty)
+    data so they can continue in their own degraded mode.
+    """
+    try:
+        result = fn(*args, **kwargs)
+        # If the agent itself returned an error status, promote to degraded
+        if result.get("status") == "error":
+            result["status"] = "degraded"
+            result.setdefault("degraded_reason", result.get("summary", "Agent returned error status"))
+        return result
+    except Exception as exc:
+        if verbose:
+            print(f"[pipeline] {agent_name} failed with exception: {exc}")
+        return {
+            "agent": agent_name,
+            "status": "degraded",
+            "degraded_reason": f"Exception: {exc}",
+            "summary": f"{agent_name} failed: {exc}. Downstream agents will use defaults.",
+            # Provide empty but structurally valid data so downstream can continue
+            "analysis": "",
+            "features": {},
+            "regime": {},
+            "forecast": {},
+            "risk_plan": {},
+            "metrics": {},
+            "signals": [],
+            "memory": {},
+            "track_record_factor": 1.0,
+            "pairs": [],
+            "macro_features": {},
+            "fundamental_features": {},
+        }
+
+
 def _build_report_file(
     stock_symbol: str,
     final_report: str,
@@ -49,8 +100,13 @@ def _build_report_file(
     regime_result: Dict[str, Any],
     forecast_result: Dict[str, Any],
     risk_result: Dict[str, Any],
-    backtest_result: Dict[str, Any],
+    memory_result: Dict[str, Any] | None = None,
+    fundamental_result: Dict[str, Any] | None = None,
+    macro_result: Dict[str, Any] | None = None,
 ) -> str:
+    memory_result = memory_result or {}
+    fundamental_result = fundamental_result or {}
+    macro_result = macro_result or {}
     output_file = f"report_{stock_symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     with open(output_file, "w") as f:
         f.write(final_report)
@@ -77,9 +133,13 @@ def _build_report_file(
         f.write("\nRISK PLAN:\n")
         f.write(risk_result.get("summary", "") + "\n")
         f.write(json.dumps(risk_result.get("risk_plan", {}), indent=2) + "\n")
-        f.write("\nBACKTEST SNAPSHOT:\n")
-        f.write(backtest_result.get("summary", "") + "\n")
-        f.write(json.dumps(backtest_result.get("metrics", {}), indent=2) + "\n")
+        f.write("\nFUNDAMENTAL ANALYSIS:\n")
+        f.write(fundamental_result.get("analysis", "") + "\n")
+        f.write("\nMACROECONOMIC ANALYSIS:\n")
+        f.write(macro_result.get("analysis", "") + "\n")
+        f.write("\nMEMORY (HISTORICAL PREDICTION PERFORMANCE):\n")
+        f.write(memory_result.get("summary", "No memory data available.") + "\n")
+        f.write(json.dumps(memory_result.get("memory", {}), indent=2) + "\n")
     return output_file
 
 
@@ -91,9 +151,7 @@ def run_full_analysis(
     save_report: bool = True,
     progress_callback: ProgressCallback | None = None,
 ) -> Dict[str, Any]:
-    """
-    Execute the full 10-stage financial analysis pipeline.
-    """
+    """Execute the full financial analysis pipeline with fault tolerance."""
     total_steps = 10
     symbol = stock_symbol.strip().upper()
     if not symbol:
@@ -112,7 +170,7 @@ def run_full_analysis(
 
     _emit_progress(progress_callback, 1, total_steps, "Initializing models and agents")
     llm = ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL", "gpt-4-turbo-preview"),
+model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.3")),
         api_key=api_key,
     )
@@ -124,11 +182,29 @@ def run_full_analysis(
     pair_monitor_agent = PairMonitorAgent(verbose=verbose)
     feature_agent = FeatureEngineeringAgent(verbose=verbose)
     regime_agent = RegimeAgent(verbose=verbose)
-    forecast_agent = ForecastAgent(verbose=verbose)
+    # V2: Initialize cross-sectional feature service if model version is v2
+    cs_service = None
+    if os.getenv("FORECAST_MODEL_VERSION", "v1") == "v2":
+        cs_service = CrossSectionalFeatureService(
+            ticker_list_path=os.getenv("TRAIN_TICKERS_PATH", "data/sp500_top100.json"),
+            cache_dir=os.getenv("CS_CACHE_DIR", "data/cross_section_cache"),
+            cache_ttl_hours=float(os.getenv("CS_CACHE_TTL_HOURS", "24")),
+            verbose=verbose,
+        )
+    forecast_agent = ForecastAgent(verbose=verbose, cross_section_service=cs_service)
     risk_agent = RiskAgent(verbose=verbose)
-    backtest_agent = BacktestAgent(verbose=verbose)
+    memory_agent = MemoryAgent(verbose=verbose)
+    fundamental_agent = FundamentalAnalysisAgent(llm, verbose=verbose)
+    macro_agent = MacroAnalysisAgent(llm, verbose=verbose)
+    macro_fund_provider = MacroFundamentalFeatureProvider(verbose=verbose)
     supervisor_agent = SupervisorAgent(llm)
-    print("Initializing agents...")
+    reviewer_llm = ChatOpenAI(
+        model=os.getenv("REVIEWER_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
+        temperature=0.2,
+        api_key=api_key,
+    )
+    reviewer_agent = ReviewerAgent(reviewer_llm)
+    _emit_progress(progress_callback, 1, total_steps, "Agents initialized, connecting storage")
 
     storage = None
     storage_enabled = os.getenv("STORAGE_ENABLED", "true").lower() == "true"
@@ -138,47 +214,136 @@ def run_full_analysis(
         except Exception:
             storage = None
 
-    print("Analyzing pair ledger...")
-    pair_ledger = ledger_agent.analyze()
-    print("Pair ledger analyzed:", pair_ledger)
+    _emit_progress(progress_callback, 1, total_steps, "Analyzing pair ledger")
 
-    _emit_progress(progress_callback, 2, total_steps, "Running historical analysis")
-    historical_result = historical_agent.analyze(symbol)
+    # Step 0: Track matured predictions and recall memory
+    memory_result: Dict[str, Any] = {
+        "agent": "memory",
+        "status": "skipped",
+        "memory": {},
+        "track_record_factor": 1.0,
+        "summary": "Memory module skipped (storage unavailable).",
+    }
+    if storage:
+        try:
+            _emit_progress(progress_callback, 1, total_steps, "Tracking matured predictions")
+            track_result = track_outcomes(storage=storage, verbose=verbose)
+            if verbose and track_result.get("tracked", 0) > 0:
+                print(f"[memory] Tracked {track_result['tracked']} matured prediction(s).")
+        except Exception:
+            pass  # Non-critical; continue even if tracking fails
 
-    _emit_progress(progress_callback, 3, total_steps, "Running indicator analysis")
-    indicator_result = indicator_agent.analyze(symbol)
+        try:
+            _emit_progress(progress_callback, 1, total_steps, "Recalling historical prediction performance")
+            memory_result = memory_agent.recall(symbol, storage)
+        except Exception:
+            pass  # Non-critical; use defaults
 
-    _emit_progress(progress_callback, 4, total_steps, "Running news sentiment analysis")
-    news_result = news_agent.analyze(symbol)
+    # ── P2: Layer 0 — parallel execution of independent agents ──────────
+    _emit_progress(progress_callback, 2, total_steps, "Running independent agents in parallel (Layer 0)")
 
-    _emit_progress(progress_callback, 5, total_steps, "Running pair monitor analysis")
+    layer0_futures: Dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=9, thread_name_prefix="agent") as pool:
+        layer0_futures["pair_ledger"] = pool.submit(
+            _safe_run, "pair_ledger", ledger_agent.analyze, verbose=verbose,
+        )
+        layer0_futures["historical"] = pool.submit(
+            _safe_run, "historical", historical_agent.analyze, symbol, verbose=verbose,
+        )
+        layer0_futures["indicator"] = pool.submit(
+            _safe_run, "indicator", indicator_agent.analyze, symbol, verbose=verbose,
+        )
+        layer0_futures["news"] = pool.submit(
+            _safe_run, "news", news_agent.analyze, symbol, verbose=verbose,
+        )
+        layer0_futures["feature"] = pool.submit(
+            _safe_run, "feature", feature_agent.analyze, symbol, verbose=verbose,
+        )
+        layer0_futures["fundamental"] = pool.submit(
+            _safe_run, "fundamental", fundamental_agent.analyze, symbol, verbose=verbose,
+        )
+        layer0_futures["macro"] = pool.submit(
+            _safe_run, "macro", macro_agent.analyze, symbol, verbose=verbose,
+        )
+        # Structured macro/fundamental features for downstream numeric agents
+        layer0_futures["macro_fund_features"] = pool.submit(
+            _safe_run, "macro_fund_features", macro_fund_provider.extract, symbol, verbose=verbose,
+        )
+
+    # Collect Layer 0 results
+    pair_ledger = layer0_futures["pair_ledger"].result()
+    historical_result = layer0_futures["historical"].result()
+    indicator_result = layer0_futures["indicator"].result()
+    news_result = layer0_futures["news"].result()
+    feature_result = layer0_futures["feature"].result()
+    fundamental_result = layer0_futures["fundamental"].result()
+    macro_result = layer0_futures["macro"].result()
+    macro_fund_features = layer0_futures["macro_fund_features"].result()
+
+    if verbose:
+        degraded_agents = [
+            name for name, fut in layer0_futures.items()
+            if fut.result().get("status") in ("degraded", "error", "skipped")
+        ]
+        if degraded_agents:
+            print(f"[pipeline] Layer 0 degraded agents: {degraded_agents}")
+
+    _emit_progress(progress_callback, 3, total_steps, "Layer 0 complete")
+
+    # ── Layer 1: PairMonitor (depends on PairLedger) ────────────────────
+    _emit_progress(progress_callback, 4, total_steps, "Running pair monitor analysis")
     if pair_ledger.get("status") == "success":
-        pair_monitor_result = pair_monitor_agent.analyze(
+        pair_monitor_result = _safe_run(
+            "pair_monitor",
+            pair_monitor_agent.analyze,
             pair_ledger.get("pairs", []),
             focus_symbol=symbol,
+            verbose=verbose,
         )
     else:
         pair_monitor_result = {
             "agent": "pair_monitor",
-            "status": "skipped",
+            "status": "degraded",
+            "degraded_reason": "Pair ledger unavailable; monitoring skipped.",
             "summary": "Pair ledger unavailable; monitoring skipped.",
             "signals": [],
         }
 
-    _emit_progress(progress_callback, 6, total_steps, "Building quantitative features")
-    feature_result = feature_agent.analyze(symbol)
+    # ── Layer 1: Regime (depends on Feature + MacroFundFeatures) ─────────
+    _emit_progress(progress_callback, 5, total_steps, "Classifying market regime")
+    regime_result = _safe_run(
+        "regime", regime_agent.analyze, symbol, feature_result,
+        macro_fund_features, verbose=verbose,
+    )
 
-    _emit_progress(progress_callback, 7, total_steps, "Classifying market regime")
-    regime_result = regime_agent.analyze(symbol, feature_result)
+    # ── Layer 2: Forecast (depends on Feature + Regime + MacroFundFeatures) ──
+    _emit_progress(progress_callback, 6, total_steps, "Generating probabilistic forecast")
+    forecast_result = _safe_run(
+        "forecast",
+        forecast_agent.analyze,
+        symbol,
+        feature_result,
+        regime_result,
+        macro_fund_features,
+        verbose=verbose,
+    )
 
-    _emit_progress(progress_callback, 8, total_steps, "Generating probabilistic forecast")
-    forecast_result = forecast_agent.analyze(symbol, feature_result, regime_result)
+    # ── Layer 3: Risk (depends on Forecast + Regime + Feature + Memory + MacroFundFeatures) ─
+    _emit_progress(progress_callback, 7, total_steps, "Generating risk plan")
+    risk_result = _safe_run(
+        "risk",
+        risk_agent.analyze,
+        symbol,
+        forecast_result,
+        regime_result,
+        feature_result,
+        memory_result,
+        macro_fund_features,
+        verbose=verbose,
+    )
 
-    _emit_progress(progress_callback, 9, total_steps, "Generating risk plan and backtest snapshot")
-    risk_result = risk_agent.analyze(symbol, forecast_result, regime_result, feature_result)
-    backtest_result = backtest_agent.analyze(symbol)
-
-    _emit_progress(progress_callback, 10, total_steps, "Synthesizing final recommendation")
+    # ── Layer 4: Supervisor (synthesizes everything) ────────────────────
+    _emit_progress(progress_callback, 8, total_steps, "Synthesizing final recommendation")
     recommendation = supervisor_agent.make_recommendation(
         historical_result,
         indicator_result,
@@ -189,8 +354,45 @@ def run_full_analysis(
         regime_result,
         forecast_result,
         risk_result,
-        backtest_result,
+        memory_result,
+        fundamental_result,
+        macro_result,
     )
+
+    # ── Layer 4.5: Reflection Loop (Reviewer → Supervisor Revision) ─────
+    draft_text = recommendation.get("recommendation", "")
+    _emit_progress(progress_callback, 9, total_steps, "Reviewing recommendation (reflection loop)")
+    review_result = _safe_run(
+        "reviewer",
+        reviewer_agent.review,
+        draft_text,
+        news_result,
+        fundamental_result,
+        macro_result,
+        forecast_result,
+        risk_result,
+        memory_result,
+        regime_result,
+        verbose=verbose,
+    )
+
+    review_text = review_result.get("review", "")
+    if review_result.get("status") == "success" and "ISSUES_FOUND: 0" not in review_text:
+        _emit_progress(progress_callback, 10, total_steps, "Revising recommendation based on review")
+        revised_text = supervisor_agent.revise_recommendation(
+            draft_text, review_text, symbol
+        )
+        recommendation["recommendation"] = revised_text
+        recommendation["review"] = review_text
+        recommendation["was_revised"] = True
+        if verbose:
+            print("[pipeline] Recommendation revised after reviewer critique.")
+    else:
+        recommendation["review"] = review_text
+        recommendation["was_revised"] = False
+        if verbose:
+            print("[pipeline] Reviewer found no issues; using original recommendation.")
+
     recommendation["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     final_report = supervisor_agent.format_final_report(recommendation)
 
@@ -207,7 +409,9 @@ def run_full_analysis(
             regime_result,
             forecast_result,
             risk_result,
-            backtest_result,
+            memory_result,
+            fundamental_result,
+            macro_result,
         )
 
     persisted = False
@@ -219,7 +423,7 @@ def run_full_analysis(
                 stock_symbol=symbol,
                 interval=pair_monitor_agent.interval,
             )
-            storage.save_prediction(forecast_result, stock_symbol=symbol)
+            storage.save_prediction(forecast_result, stock_symbol=symbol, regime_result=regime_result)
             persisted = True
         except Exception:
             persisted = False
@@ -241,7 +445,10 @@ def run_full_analysis(
             "regime": regime_result,
             "forecast": forecast_result,
             "risk": risk_result,
-            "backtest": backtest_result,
+            "memory": memory_result,
+            "fundamental": fundamental_result,
+            "macro": macro_result,
+            "macro_fund_features": macro_fund_features,
             "recommendation": recommendation,
         },
     }

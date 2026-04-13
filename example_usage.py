@@ -13,7 +13,6 @@ from agents import (
     RegimeAgent,
     ForecastAgent,
     RiskAgent,
-    BacktestAgent,
     NewsSentimentAgent,
     PairLedgerAgent,
     PairMonitorAgent,
@@ -29,7 +28,7 @@ def example_single_stock():
     
     # Initialize LLM
     llm = ChatOpenAI(
-        model="gpt-4-turbo-preview",
+model="gpt-4o",
         temperature=0.3
     )
     
@@ -41,7 +40,6 @@ def example_single_stock():
     regime_agent = RegimeAgent()
     forecast_agent = ForecastAgent()
     risk_agent = RiskAgent()
-    backtest_agent = BacktestAgent()
     ledger_agent = PairLedgerAgent()
     pair_monitor_agent = PairMonitorAgent()
     supervisor_agent = SupervisorAgent(llm)
@@ -99,10 +97,6 @@ def example_single_stock():
     risk_result = risk_agent.analyze(stock_symbol, forecast_result, regime_result, feature_result)
     print(risk_result)
 
-    print("Running backtest snapshot...")
-    backtest_result = backtest_agent.analyze(stock_symbol)
-    print(backtest_result)
-
     # Get recommendation
     print("Generating recommendation...")
     recommendation = supervisor_agent.make_recommendation(
@@ -115,7 +109,6 @@ def example_single_stock():
         regime_result,
         forecast_result,
         risk_result,
-        backtest_result,
     )
     
     # Display report
@@ -126,7 +119,7 @@ def example_multiple_stocks():
     """Example: Analyze multiple stocks"""
     load_dotenv()
     
-    llm = ChatOpenAI(model="gpt-4-turbo-preview", temperature=0.3)
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
     
     historical_agent = HistoricalAnalysisAgent(llm)
     news_agent = NewsSentimentAgent(llm)
@@ -135,7 +128,6 @@ def example_multiple_stocks():
     regime_agent = RegimeAgent()
     forecast_agent = ForecastAgent()
     risk_agent = RiskAgent()
-    backtest_agent = BacktestAgent()
     ledger_agent = PairLedgerAgent()
     pair_monitor_agent = PairMonitorAgent()
     supervisor_agent = SupervisorAgent(llm)
@@ -169,7 +161,6 @@ def example_multiple_stocks():
         regime_result = regime_agent.analyze(stock, feature_result)
         forecast_result = forecast_agent.analyze(stock, feature_result, regime_result)
         risk_result = risk_agent.analyze(stock, forecast_result, regime_result, feature_result)
-        backtest_result = backtest_agent.analyze(stock)
 
         recommendation = supervisor_agent.make_recommendation(
             historical_result,
@@ -181,7 +172,6 @@ def example_multiple_stocks():
             regime_result,
             forecast_result,
             risk_result,
-            backtest_result,
         )
         
         print(supervisor_agent.format_final_report(recommendation))
