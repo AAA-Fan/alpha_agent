@@ -1,5 +1,5 @@
 """
-Pipeline orchestrator shared by CLI and frontend dashboards.
+Pipeline orchestrator shared by CLI and programmatic usage.
 """
 
 from __future__ import annotations

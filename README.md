@@ -11,7 +11,7 @@
 
 **A precision-engineered multi-agent financial advisory system that fuses LLM reasoning with quantitative ML models for institutional-grade stock analysis.**
 
-[Architecture](#architecture) · [Quant Pipeline](#-the-quantitative-pipeline-what-sets-us-apart) · [Quick Start](#-quick-start) · [Backtest](#-backtest-engine) · [API & Dashboard](#-api--dashboard) · [Configuration](#-configuration)
+[Architecture](#architecture) · [Quant Pipeline](#-the-quantitative-pipeline-what-sets-us-apart) · [Quick Start](#-quick-start) · [Backtest](#-backtest-engine) · [Configuration](#-configuration)
 
 </div>
 
@@ -37,6 +37,10 @@ Most LLM-based trading frameworks treat the market as a **text comprehension pro
 ---
 
 ## Architecture
+
+<p align="center">
+  <img src="assets/schema.png" width="800" alt="FinanciAlAgent Architecture"/>
+</p>
 
 FinanciAlAgent decomposes financial analysis into **15 specialized agents** organized in a **layered dependency graph** with parallel execution:
 
@@ -101,6 +105,10 @@ FinanciAlAgent decomposes financial analysis into **15 specialized agents** orga
 ---
 
 ## 🔬 The Quantitative Pipeline (What Sets Us Apart)
+
+<p align="center">
+  <img src="assets/quantitative_pipeline.png" width="800" alt="Quantitative Pipeline"/>
+</p>
 
 This is where FinanciAlAgent diverges from text-only frameworks. The quant pipeline is a **4-stage chain** where each stage adds measurable alpha, validated through ablation testing:
 
@@ -172,6 +180,10 @@ Gate ⑦  Dynamic Stop-Loss   — 2.5× daily volatility, clamped to [1%, 8%]
 ---
 
 ## 🧠 LLM-Powered Qualitative Agents
+
+<p align="center">
+  <img src="assets/LLM-Powered_Qualitative_Agents.png" width="800" alt="LLM-Powered Qualitative Agents"/>
+</p>
 
 While the quant pipeline handles numbers, LLM agents handle **context, reasoning, and synthesis**:
 
@@ -245,33 +257,17 @@ python scripts/debug_stage3_regime.py \
   --rounds v0,v1,v1b,v1b_C
 ```
 
-### Sample Backtest Results (AAPL, 2023-01-01 → 2025-12-31)
-
-| Metric | Value |
-|:---|:---|
-| Total Return | **+87.56%** |
-| Alpha (vs Buy & Hold) | **+8.49%** |
-| Sharpe Ratio | 1.20 |
-| Sortino Ratio | 2.54 |
-| Max Drawdown | -13.53% |
-| Hit Rate | 54.93% |
-| Total Trades | 142 |
-
-> ⚠️ *Backtest results are for research validation only. Past performance does not guarantee future results.*
-
----
-
 ## 🚀 Quick Start
 
 ### Installation
 
 ```bash
 git clone <your-repo-url>
-cd financailagent
+cd financialagent
 
 # Create environment
-conda create -n financailagent python=3.10
-conda activate financailagent
+conda create -n financialagent python=3.10
+conda activate financialagent
 
 # Install dependencies
 pip install -r requirements.txt
@@ -336,40 +332,6 @@ print(f"Stop-loss: {risk['risk_plan']['stop_loss_pct']:.3f}")
 
 ---
 
-## 🖥 API & Dashboard
-
-### Streamlit Dashboard
-
-```bash
-streamlit run dashboard.py
-```
-
-Features:
-- **Live Analysis** — Full 15-agent pipeline with real-time progress
-- **Monitoring** — Track recommendations, predictions, pair signals, realized outcomes
-- **Configuration** — Runtime/model/storage state overview
-
-### FastAPI Backend
-
-```bash
-uvicorn api:app --host 0.0.0.0 --port 8000
-```
-
-| Endpoint | Method | Description |
-|:---|:---|:---|
-| `/health` | GET | Health check |
-| `/analyze` | POST | Run full analysis pipeline |
-| `/storage/recommendations` | GET | Historical recommendations |
-| `/storage/predictions` | GET | Prediction history |
-| `/storage/pair-signals` | GET | Pair divergence signals |
-| `/storage/realized-outcomes` | GET | Tracked prediction outcomes |
-
-```bash
-curl -X POST http://localhost:8000/analyze \
-  -H "Content-Type: application/json" \
-  -d '{"symbol":"AAPL","persist":true,"save_report":true}'
-```
-
 ---
 
 ## ⚙ Configuration
@@ -427,7 +389,7 @@ curl -X POST http://localhost:8000/analyze \
 ## 📁 Project Structure
 
 ```
-financailagent/
+financialagent/
 ├── agents/                          # 15 specialized agents
 │   ├── feature_engineering_agent.py # ML feature computation
 │   ├── regime_agent.py              # 3D market regime classifier
@@ -463,9 +425,7 @@ financailagent/
 │   ├── storage.py                   # SQLite/PostgreSQL persistence
 │   └── yfinance_cache.py            # Market data caching
 ├── orchestrator.py                  # Pipeline orchestrator (parallel execution)
-├── main.py                          # CLI entry point
-├── api.py                           # FastAPI backend
-├── dashboard.py                     # Streamlit frontend
+├── main.py                          # CLI entry point (Rich UI)
 └── example_usage.py                 # Quick-start example
 ```
 
@@ -491,15 +451,8 @@ financailagent/
 | `scikit-learn` | Calibration, cross-validation |
 | `pandas` + `numpy` | Data processing |
 | `yfinance` | Market data |
-| `streamlit` + `plotly` | Dashboard |
-| `fastapi` + `uvicorn` | API server |
+
 | `tavily-python` + `duckduckgo-search` | News search |
-
----
-
-## Disclaimer
-
-> This system is designed for **research and educational purposes only**. It is not intended as financial, investment, or trading advice. Trading performance may vary based on model configuration, data quality, market conditions, and other non-deterministic factors. Always consult with a qualified financial advisor before making investment decisions. Past performance does not guarantee future results.
 
 ---
 
