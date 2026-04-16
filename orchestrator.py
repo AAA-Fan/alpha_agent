@@ -259,13 +259,8 @@ model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         layer0_futures["feature"] = pool.submit(
             _safe_run, "feature", feature_agent.analyze, symbol, verbose=verbose,
         )
-        layer0_futures["fundamental"] = pool.submit(
-            _safe_run, "fundamental", fundamental_agent.analyze, symbol, verbose=verbose,
-        )
-        layer0_futures["macro"] = pool.submit(
-            _safe_run, "macro", macro_agent.analyze, symbol, verbose=verbose,
-        )
         # Structured macro/fundamental features for downstream numeric agents
+        # Also provides raw reports for LLM agents (fundamental + macro)
         layer0_futures["macro_fund_features"] = pool.submit(
             _safe_run, "macro_fund_features", macro_fund_provider.extract, symbol, verbose=verbose,
         )
@@ -276,13 +271,29 @@ model=os.getenv("OPENAI_MODEL", "gpt-4o"),
     indicator_result = layer0_futures["indicator"].result()
     news_result = layer0_futures["news"].result()
     feature_result = layer0_futures["feature"].result()
-    fundamental_result = layer0_futures["fundamental"].result()
-    macro_result = layer0_futures["macro"].result()
     macro_fund_features = layer0_futures["macro_fund_features"].result()
 
+    # ── Layer 0b: LLM agents that depend on Provider data ──────────────
+    # Fundamental and Macro agents now receive pre-fetched data from Provider
+    # instead of calling Alpha Vantage directly. Run them in parallel.
+    layer0b_futures: Dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm-agent") as pool:
+        layer0b_futures["fundamental"] = pool.submit(
+            _safe_run, "fundamental", fundamental_agent.analyze, symbol,
+            macro_fund_features, verbose=verbose,
+        )
+        layer0b_futures["macro"] = pool.submit(
+            _safe_run, "macro", macro_agent.analyze, symbol,
+            macro_fund_features, verbose=verbose,
+        )
+
+    fundamental_result = layer0b_futures["fundamental"].result()
+    macro_result = layer0b_futures["macro"].result()
+
     if verbose:
+        all_layer0 = {**layer0_futures, **layer0b_futures}
         degraded_agents = [
-            name for name, fut in layer0_futures.items()
+            name for name, fut in all_layer0.items()
             if fut.result().get("status") in ("degraded", "error", "skipped")
         ]
         if degraded_agents:

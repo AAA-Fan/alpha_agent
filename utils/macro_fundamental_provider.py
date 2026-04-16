@@ -308,6 +308,58 @@ def _fetch_macro_features(api_key: str, verbose: bool = False) -> Dict[str, Opti
             print(f"  [macro] SPY momentum failed: {exc}")
         features["spy_momentum_20d"] = None
 
+    # ── 7. Nonfarm Payroll (monthly) ────────────────────────────────
+    try:
+        _throttle()
+        data = _av_get("NONFARM_PAYROLL", api_key)
+        series = data.get("data", [])[:6]
+        features["_raw_nonfarm_payroll"] = series
+        if verbose:
+            print(f"  [macro] Nonfarm Payroll: {len(series)} data points")
+    except Exception as exc:
+        if verbose:
+            print(f"  [macro] Nonfarm Payroll failed: {exc}")
+        features["_raw_nonfarm_payroll"] = []
+
+    # ── 8. Real GDP (quarterly) ─────────────────────────────────────
+    try:
+        _throttle()
+        data = _av_get("REAL_GDP", api_key, interval="quarterly")
+        series = data.get("data", [])[:6]
+        features["_raw_real_gdp"] = series
+        if verbose:
+            print(f"  [macro] Real GDP: {len(series)} data points")
+    except Exception as exc:
+        if verbose:
+            print(f"  [macro] Real GDP failed: {exc}")
+        features["_raw_real_gdp"] = []
+
+    # ── 9. Retail Sales (monthly) ───────────────────────────────────
+    try:
+        _throttle()
+        data = _av_get("RETAIL_SALES", api_key)
+        series = data.get("data", [])[:6]
+        features["_raw_retail_sales"] = series
+        if verbose:
+            print(f"  [macro] Retail Sales: {len(series)} data points")
+    except Exception as exc:
+        if verbose:
+            print(f"  [macro] Retail Sales failed: {exc}")
+        features["_raw_retail_sales"] = []
+
+    # ── 10. WTI Crude Oil (monthly) ─────────────────────────────────
+    try:
+        _throttle()
+        data = _av_get("WTI", api_key, interval="monthly")
+        series = data.get("data", [])[:6]
+        features["_raw_wti"] = series
+        if verbose:
+            print(f"  [macro] WTI Crude Oil: {len(series)} data points")
+    except Exception as exc:
+        if verbose:
+            print(f"  [macro] WTI Crude Oil failed: {exc}")
+        features["_raw_wti"] = []
+
     return features
 
 
@@ -344,6 +396,9 @@ def _fetch_fundamental_features(
         _throttle()
         overview = _av_get("OVERVIEW", api_key, symbol=symbol)
 
+        # Save raw overview data for report generation
+        features["_raw_overview"] = overview
+
         features["pe_ratio"] = _safe_float(overview.get("PERatio"))
         features["peg_ratio"] = _safe_float(overview.get("PEGRatio"))
         features["pb_ratio"] = _safe_float(overview.get("PriceToBookRatio"))
@@ -370,6 +425,7 @@ def _fetch_fundamental_features(
     except Exception as exc:
         if verbose:
             print(f"  [fundamental] Overview failed: {exc}")
+        features["_raw_overview"] = {}
         for k in [
             "pe_ratio", "peg_ratio", "pb_ratio", "ps_ratio", "ev_ebitda",
             "dividend_yield", "beta", "roe", "profit_margin",
@@ -410,6 +466,32 @@ def _fetch_fundamental_features(
 
     # ── Composite financial health score (0-1) ──────────────────────
     features["financial_health_score"] = _compute_health_score(features)
+
+    # ── Raw data for LLM agents (income statement + cash flow) ──────
+    try:
+        _throttle()
+        income_data = _av_get("INCOME_STATEMENT", api_key, symbol=symbol)
+        features["_raw_income_statement"] = income_data
+        if verbose:
+            n_annual = len(income_data.get("annualReports", []))
+            n_quarterly = len(income_data.get("quarterlyReports", []))
+            print(f"  [fundamental] Income Statement: {n_annual} annual, {n_quarterly} quarterly")
+    except Exception as exc:
+        if verbose:
+            print(f"  [fundamental] Income Statement failed: {exc}")
+        features["_raw_income_statement"] = {}
+
+    try:
+        _throttle()
+        cashflow_data = _av_get("CASH_FLOW", api_key, symbol=symbol)
+        features["_raw_cash_flow"] = cashflow_data
+        if verbose:
+            n_annual = len(cashflow_data.get("annualReports", []))
+            print(f"  [fundamental] Cash Flow: {n_annual} annual reports")
+    except Exception as exc:
+        if verbose:
+            print(f"  [fundamental] Cash Flow failed: {exc}")
+        features["_raw_cash_flow"] = {}
 
     return features
 
@@ -454,8 +536,329 @@ def _compute_health_score(features: Dict[str, Optional[float]]) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Historical Macro Feature Extraction (for training)
+# Report Generation (for LLM Agents)
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _fmt(val: Optional[float], decimals: int = 2, prefix: str = "", suffix: str = "") -> str:
+    """Format a float for display, returning 'N/A' if None."""
+    if val is None:
+        return "N/A"
+    return f"{prefix}{val:,.{decimals}f}{suffix}"
+
+
+def _fmt_large(val: Optional[float]) -> str:
+    """Format a large number in human-readable form."""
+    if val is None:
+        return "N/A"
+    abs_val = abs(val)
+    sign = "-" if val < 0 else ""
+    if abs_val >= 1e12:
+        return f"{sign}${abs_val / 1e12:.2f}T"
+    if abs_val >= 1e9:
+        return f"{sign}${abs_val / 1e9:.2f}B"
+    if abs_val >= 1e6:
+        return f"{sign}${abs_val / 1e6:.2f}M"
+    return f"{sign}${abs_val:,.0f}"
+
+
+def _format_series(series: list, suffix: str = "", prefix: str = "") -> str:
+    """Format a time series into a readable table string."""
+    if not series:
+        return "  No data available."
+    lines = []
+    for dp in series:
+        date = dp.get("date", "N/A")
+        val = _safe_float(dp.get("value"))
+        lines.append(f"  {date}: {_fmt(val, prefix=prefix, suffix=suffix)}")
+    return "\n".join(lines)
+
+
+def _trend_arrow(series: list) -> str:
+    """Return a simple trend indicator based on recent values."""
+    values = [_safe_float(dp.get("value")) for dp in series[:2]] if series else []
+    clean = [v for v in values if v is not None]
+    if len(clean) < 2:
+        return "→ (insufficient data)"
+    if clean[0] > clean[1]:
+        return "↑ (rising)"
+    elif clean[0] < clean[1]:
+        return "↓ (falling)"
+    return "→ (flat)"
+
+
+def _pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    """Return a/b as a percentage, or None if not computable."""
+    if a is None or b is None or b == 0:
+        return None
+    return (a / b) * 100
+
+
+def _build_macro_report(macro_features: Dict[str, Any]) -> str:
+    """Build a formatted macro report from Provider data for LLM consumption.
+
+    Uses both numeric features and raw time series data (_raw_* keys).
+    """
+    sections = []
+
+    # 1. Federal Funds Rate
+    ffr = macro_features.get("fed_funds_rate")
+    rc3m = macro_features.get("rate_change_3m")
+    sections.append(
+        f"FEDERAL FUNDS RATE:\n"
+        f"  Current: {_fmt(ffr, suffix='%')}\n"
+        f"  3-Month Change: {_fmt(rc3m, suffix=' pp')}"
+    )
+
+    # 2. Treasury Yields
+    y10 = macro_features.get("treasury_yield_10y")
+    y2 = macro_features.get("treasury_yield_2y")
+    spread = macro_features.get("yield_spread_10y2y")
+    spread_status = ""
+    if spread is not None:
+        if spread < 0:
+            spread_status = " ⚠️ INVERTED — historically a recession warning signal"
+        elif spread < 0.5:
+            spread_status = " ⚡ Very flat — potential slowdown signal"
+        else:
+            spread_status = " ✅ Positively sloped — normal expansion signal"
+    sections.append(
+        f"TREASURY YIELDS:\n"
+        f"  10-Year: {_fmt(y10, suffix='%')}\n"
+        f"  2-Year: {_fmt(y2, suffix='%')}\n"
+        f"  Yield Spread (10Y-2Y): {_fmt(spread, suffix='%')}{spread_status}"
+    )
+
+    # 3. CPI
+    cpi = macro_features.get("cpi_yoy")
+    sections.append(f"CPI (Year-over-Year): {_fmt(cpi, suffix='%')}")
+
+    # 4. Unemployment
+    unemp = macro_features.get("unemployment_rate")
+    sections.append(f"UNEMPLOYMENT RATE: {_fmt(unemp, suffix='%')}")
+
+    # 5. VIX
+    vix = macro_features.get("vix_level")
+    vix_pct = macro_features.get("vix_percentile_1y")
+    sections.append(
+        f"VIX (Volatility Index Proxy):\n"
+        f"  Level: {_fmt(vix)}\n"
+        f"  1-Year Percentile: {_fmt(vix_pct, decimals=1, suffix='%') if vix_pct is not None else 'N/A'}"
+    )
+
+    # 6. SPY Momentum
+    spy_mom = macro_features.get("spy_momentum_20d")
+    sections.append(
+        f"SPY 20-DAY MOMENTUM: {_fmt(spy_mom, decimals=4, suffix='') if spy_mom is not None else 'N/A'}"
+    )
+
+    # 7. Nonfarm Payroll (from raw data)
+    nfp_series = macro_features.get("_raw_nonfarm_payroll", [])
+    if nfp_series:
+        trend = _trend_arrow(nfp_series)
+        sections.append(
+            f"NONFARM PAYROLL (Monthly, thousands) (Trend: {trend}):\n"
+            + _format_series(nfp_series, suffix="K")
+        )
+
+    # 8. Real GDP (from raw data)
+    gdp_series = macro_features.get("_raw_real_gdp", [])
+    if gdp_series:
+        trend = _trend_arrow(gdp_series)
+        sections.append(
+            f"REAL GDP (Quarterly, billions USD) (Trend: {trend}):\n"
+            + _format_series(gdp_series, suffix="B")
+        )
+
+    # 9. Retail Sales (from raw data)
+    retail_series = macro_features.get("_raw_retail_sales", [])
+    if retail_series:
+        trend = _trend_arrow(retail_series)
+        sections.append(
+            f"RETAIL SALES (Monthly, millions USD) (Trend: {trend}):\n"
+            + _format_series(retail_series, suffix="M")
+        )
+
+    # 10. WTI Crude Oil (from raw data)
+    wti_series = macro_features.get("_raw_wti", [])
+    if wti_series:
+        trend = _trend_arrow(wti_series)
+        sections.append(
+            f"WTI CRUDE OIL PRICE (Monthly, USD/barrel) (Trend: {trend}):\n"
+            + _format_series(wti_series, prefix="$")
+        )
+
+    report = (
+        f"\nMACROECONOMIC ENVIRONMENT REPORT (US)\n"
+        f"{'=' * 60}\n"
+        f"Data Source: Alpha Vantage  |  Most recent data points shown\n\n"
+    )
+    report += "\n\n".join(sections)
+    return report
+
+
+def _build_fundamental_report(
+    symbol: str,
+    fundamental_features: Dict[str, Any],
+    overview_data: Dict[str, Any],
+) -> str:
+    """Build a formatted fundamental report from Provider data for LLM consumption.
+
+    Uses numeric features, raw income statement, raw cash flow, and overview data.
+    """
+    company_name = overview_data.get("Name", symbol)
+    sector = overview_data.get("Sector", "N/A")
+    industry = overview_data.get("Industry", "N/A")
+    market_cap = _safe_float(overview_data.get("MarketCapitalization"))
+    analyst_target = _safe_float(overview_data.get("AnalystTargetPrice"))
+    week52_high = _safe_float(overview_data.get("52WeekHigh"))
+    week52_low = _safe_float(overview_data.get("52WeekLow"))
+    eps = _safe_float(overview_data.get("EPS"))
+
+    # From numeric features
+    pe = fundamental_features.get("pe_ratio")
+    peg = fundamental_features.get("peg_ratio")
+    pb = fundamental_features.get("pb_ratio")
+    ps = fundamental_features.get("ps_ratio")
+    ev_ebitda = fundamental_features.get("ev_ebitda")
+    div_yield = fundamental_features.get("dividend_yield")
+    roe = fundamental_features.get("roe")
+    roa = _safe_float(overview_data.get("ReturnOnAssetsTTM"))
+    profit_margin = fundamental_features.get("profit_margin")
+    beta = fundamental_features.get("beta")
+    rev_growth = fundamental_features.get("revenue_growth_yoy")
+    earn_growth = fundamental_features.get("earnings_growth_yoy")
+    current_ratio = fundamental_features.get("current_ratio")
+    debt_to_equity = fundamental_features.get("debt_to_equity")
+
+    # From raw income statement
+    income_data = fundamental_features.get("_raw_income_statement", {})
+    annual_income = income_data.get("annualReports", [])
+    quarterly_income = income_data.get("quarterlyReports", [])
+    latest_annual_inc = annual_income[0] if annual_income else {}
+    prev_annual_inc = annual_income[1] if len(annual_income) > 1 else {}
+    latest_q_inc = quarterly_income[0] if quarterly_income else {}
+
+    annual_revenue = _safe_float(latest_annual_inc.get("totalRevenue"))
+    annual_net_income = _safe_float(latest_annual_inc.get("netIncome"))
+    annual_gross_profit = _safe_float(latest_annual_inc.get("grossProfit"))
+    annual_operating_income = _safe_float(latest_annual_inc.get("operatingIncome"))
+    annual_ebitda = _safe_float(latest_annual_inc.get("ebitda"))
+    prev_annual_revenue = _safe_float(prev_annual_inc.get("totalRevenue"))
+    prev_annual_net_income = _safe_float(prev_annual_inc.get("netIncome"))
+
+    # Compute YoY growth
+    revenue_growth_calc = _pct(
+        (annual_revenue - prev_annual_revenue) if annual_revenue and prev_annual_revenue else None,
+        prev_annual_revenue,
+    )
+    net_income_growth = _pct(
+        (annual_net_income - prev_annual_net_income) if annual_net_income and prev_annual_net_income else None,
+        abs(prev_annual_net_income) if prev_annual_net_income else None,
+    )
+
+    # Margins
+    gross_margin = _pct(annual_gross_profit, annual_revenue)
+    operating_margin_calc = _pct(annual_operating_income, annual_revenue)
+    net_margin = _pct(annual_net_income, annual_revenue)
+
+    # From raw cash flow
+    cashflow_data = fundamental_features.get("_raw_cash_flow", {})
+    annual_cf = cashflow_data.get("annualReports", [])
+    latest_cf = annual_cf[0] if annual_cf else {}
+    operating_cf = _safe_float(latest_cf.get("operatingCashflow"))
+    capex = _safe_float(latest_cf.get("capitalExpenditures"))
+    free_cash_flow = (operating_cf - capex) if operating_cf is not None and capex is not None else None
+    dividends_paid = _safe_float(latest_cf.get("dividendPayout"))
+
+    # From raw balance sheet (already fetched in _fetch_fundamental_features)
+    # We reuse the computed current_ratio and debt_to_equity from features
+    # and get raw balance sheet values from overview
+    total_assets_str = "N/A"
+    total_liabilities_str = "N/A"
+    total_equity_str = "N/A"
+    cash_str = "N/A"
+    total_debt_str = "N/A"
+
+    # Format dividend yield
+    div_yield_str = "N/A"
+    if div_yield is not None:
+        div_yield_pct = div_yield * 100 if div_yield < 1 else div_yield
+        div_yield_str = f"{div_yield_pct:.2f}%"
+
+    # Format ROE/ROA
+    roe_str = "N/A"
+    if roe is not None:
+        roe_pct = roe * 100 if abs(roe) < 1 else roe
+        roe_str = f"{roe_pct:.2f}%"
+    roa_str = "N/A"
+    if roa is not None:
+        roa_pct = roa * 100 if abs(roa) < 1 else roa
+        roa_str = f"{roa_pct:.2f}%"
+
+    # Format growth
+    rev_growth_str = "N/A"
+    if rev_growth is not None:
+        rg_pct = rev_growth * 100 if abs(rev_growth) < 1 else rev_growth
+        rev_growth_str = f"{rg_pct:.2f}%"
+    earn_growth_str = "N/A"
+    if earn_growth is not None:
+        eg_pct = earn_growth * 100 if abs(earn_growth) < 1 else earn_growth
+        earn_growth_str = f"{eg_pct:.2f}%"
+
+    report = f"""
+FUNDAMENTAL ANALYSIS FOR {symbol} ({company_name})
+{'=' * 60}
+Sector: {sector}  |  Industry: {industry}
+Fiscal Year End: {latest_annual_inc.get('fiscalDateEnding', 'N/A')}
+
+VALUATION METRICS:
+- Market Cap: {_fmt_large(market_cap)}
+- P/E Ratio (TTM): {_fmt(pe)}
+- PEG Ratio: {_fmt(peg)}
+- P/B Ratio: {_fmt(pb)}
+- P/S Ratio (TTM): {_fmt(ps)}
+- EV/EBITDA: {_fmt(ev_ebitda)}
+- EPS (TTM): {_fmt(eps, prefix='$')}
+- Dividend Yield: {div_yield_str}
+- Beta: {_fmt(beta)}
+- 52-Week Range: {_fmt(week52_low, prefix='$')} – {_fmt(week52_high, prefix='$')}
+- Analyst Target Price: {_fmt(analyst_target, prefix='$')}
+
+PROFITABILITY:
+- Gross Margin: {_fmt(gross_margin, suffix='%')}
+- Operating Margin: {_fmt(operating_margin_calc, suffix='%')}
+- Net Margin: {_fmt(net_margin, suffix='%')}
+- ROE (TTM): {roe_str}
+- ROA (TTM): {roa_str}
+
+INCOME STATEMENT (Annual: {latest_annual_inc.get('fiscalDateEnding', 'N/A')}):
+- Revenue: {_fmt_large(annual_revenue)}
+- Gross Profit: {_fmt_large(annual_gross_profit)}
+- Operating Income: {_fmt_large(annual_operating_income)}
+- EBITDA: {_fmt_large(annual_ebitda)}
+- Net Income: {_fmt_large(annual_net_income)}
+
+GROWTH:
+- Revenue YoY Growth: {_fmt(revenue_growth_calc, suffix='%')}
+- Net Income YoY Growth: {_fmt(net_income_growth, suffix='%')}
+- Quarterly Revenue Growth YoY: {rev_growth_str}
+- Quarterly Earnings Growth YoY: {earn_growth_str}
+
+BALANCE SHEET:
+- Current Ratio: {_fmt(current_ratio)}
+- Debt-to-Equity: {_fmt(debt_to_equity)}
+
+CASH FLOW (Annual: {latest_cf.get('fiscalDateEnding', 'N/A')}):
+- Operating Cash Flow: {_fmt_large(operating_cf)}
+- Capital Expenditures: {_fmt_large(capex)}
+- Free Cash Flow: {_fmt_large(free_cash_flow)}
+- Dividends Paid: {_fmt_large(dividends_paid)}
+
+LATEST QUARTER ({latest_q_inc.get('fiscalDateEnding', 'N/A')}):
+- Quarterly Revenue: {_fmt_large(_safe_float(latest_q_inc.get('totalRevenue')))}
+- Quarterly Net Income: {_fmt_large(_safe_float(latest_q_inc.get('netIncome')))}
+"""
+    return report
 
 def _fetch_macro_features_historical(
     api_key: str,
@@ -923,6 +1326,7 @@ class MacroFundamentalFeatureProvider:
 
         # ── Fundamental features (symbol-specific) ─────────────────
         fundamental_features: Dict[str, Optional[float]] = {}
+        overview_data: Dict[str, Any] = {}
         if symbol:
             if self.verbose:
                 print(f"[macro_fundamental] Fetching fundamental features for {symbol} ...")
@@ -930,15 +1334,36 @@ class MacroFundamentalFeatureProvider:
                 fundamental_features = _fetch_fundamental_features(
                     symbol, api_key, verbose=self.verbose,
                 )
+                # Reuse overview data already fetched by _fetch_fundamental_features
+                overview_data = fundamental_features.pop("_raw_overview", {})
             except Exception as exc:
                 fundamental_features = {}
                 errors.append(f"fundamental: {exc}")
                 if self.verbose:
                     print(f"[macro_fundamental] Fundamental extraction failed: {exc}")
 
+        # ── Build raw reports for LLM agents ───────────────────────
+        raw_macro_report = ""
+        if macro_features:
+            try:
+                raw_macro_report = _build_macro_report(macro_features)
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[macro_fundamental] Macro report generation failed: {exc}")
+
+        raw_fundamental_report = ""
+        if fundamental_features and symbol:
+            try:
+                raw_fundamental_report = _build_fundamental_report(
+                    symbol, fundamental_features, overview_data,
+                )
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[macro_fundamental] Fundamental report generation failed: {exc}")
+
         # ── Build result ───────────────────────────────────────────
-        n_macro = sum(1 for v in macro_features.values() if v is not None)
-        n_fund = sum(1 for v in fundamental_features.values() if v is not None)
+        n_macro = sum(1 for k, v in macro_features.items() if v is not None and not k.startswith("_raw"))
+        n_fund = sum(1 for k, v in fundamental_features.items() if v is not None and not k.startswith("_raw"))
         total = n_macro + n_fund
 
         status = "success" if total > 0 else "degraded"
@@ -952,6 +1377,8 @@ class MacroFundamentalFeatureProvider:
             "status": status,
             "macro_features": macro_features,
             "fundamental_features": fundamental_features,
+            "raw_macro_report": raw_macro_report,
+            "raw_fundamental_report": raw_fundamental_report,
             "summary": f"MacroFundamentalFeatureProvider: {', '.join(summary_parts)}",
         }
         if errors:
