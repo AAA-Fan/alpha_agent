@@ -45,3 +45,12 @@ data/
 docs/
 openspec/
 agents/rsi_logic_signals_amp_timeframe_correlatio.pdf
+
+# But track essential model files
+!data/forecast_model.lgb
+!data/forecast_model_meta.json
+!data/forecast_calibrator.pkl
+!data/sp500_top100.json
+!data/regime_transition_matrix.json
+!data/regime_risk_budget.json
+!data/pairs_ledger.json 
