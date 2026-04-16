@@ -48,6 +48,7 @@ from dotenv import load_dotenv
 # Reuse Stage 1 utilities
 from debug_stage1_forecast_only import (
     compute_features,
+    compute_regime_from_features,
     load_model,
     score_features,
     analyze_backtest,
@@ -59,7 +60,7 @@ from debug_stage1_forecast_only import (
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Kelly defaults (b = avg_win / avg_loss; p comes from prediction probability)
-KELLY_AVG_WIN = 0.03
+KELLY_AVG_WIN = 0.09
 KELLY_AVG_LOSS = 0.02
 
 # Position limits
@@ -270,13 +271,109 @@ def run_stage2_backtest(
     open_prices = pd.to_numeric(data["Open"], errors="coerce").values
     high_prices = pd.to_numeric(data["High"], errors="coerce").values
     low_prices = pd.to_numeric(data["Low"], errors="coerce").values
-    close_prices = pd.to_numeric(data["Close"], errors="coerce").values
+    close_prices_arr = pd.to_numeric(data["Close"], errors="coerce").values
+    close_prices_series = pd.to_numeric(data["Close"], errors="coerce")
 
     start_idx = dates.searchsorted(pd.Timestamp(start_date))
     start_idx = max(start_idx, 60)
     total_days = len(dates)
 
     cost_per_trade = (cost_bps + slippage_bps) / 10000.0 * 2  # round-trip
+
+    # ── Pre-fetch macro/fundamental historical data (once) ──
+    macro_fund_cols = meta.get("macro_fundamental_features", [])
+    macro_fund_df = None
+    if macro_fund_cols:
+        try:
+            from utils.macro_fundamental_provider import MacroFundamentalFeatureProvider
+            provider = MacroFundamentalFeatureProvider(verbose=verbose)
+            mf_start = (pd.Timestamp(start_date) - pd.Timedelta(days=120)).to_pydatetime()
+            mf_end = pd.Timestamp(end_date).to_pydatetime()
+            macro_fund_df = provider.extract_historical(
+                stock_symbol=ticker,
+                start_date=mf_start,
+                end_date=mf_end,
+            )
+            if macro_fund_df is not None and not macro_fund_df.empty:
+                macro_fund_df = macro_fund_df.sort_index()
+                macro_fund_df.index = pd.to_datetime(macro_fund_df.index)
+
+                _INTERMEDIATE_COLS = [
+                    "_ttm_eps", "_ttm_revenue", "_ttm_ebitda", "_ttm_net_income",
+                    "_total_equity", "_shares_outstanding", "_total_liabilities", "_cash",
+                ]
+                close_for_mf = close_prices_series.reindex(macro_fund_df.index, method="ffill")
+
+                if "_ttm_eps" in macro_fund_df.columns:
+                    ttm_eps = macro_fund_df["_ttm_eps"]
+                    valid = ttm_eps.notna() & (ttm_eps.abs() > 0.01) & close_for_mf.notna()
+                    macro_fund_df.loc[valid, "pe_ratio"] = close_for_mf[valid] / ttm_eps[valid]
+
+                if "_total_equity" in macro_fund_df.columns and "_shares_outstanding" in macro_fund_df.columns:
+                    equity_col = macro_fund_df["_total_equity"]
+                    shares = macro_fund_df["_shares_outstanding"]
+                    valid = equity_col.notna() & shares.notna() & (shares > 0) & close_for_mf.notna()
+                    bvps = equity_col[valid] / shares[valid]
+                    bvps_valid = bvps.abs() > 0.01
+                    final_idx = bvps_valid.index[bvps_valid]
+                    macro_fund_df.loc[final_idx, "pb_ratio"] = close_for_mf[final_idx] / bvps[bvps_valid]
+
+                if "_ttm_revenue" in macro_fund_df.columns and "_shares_outstanding" in macro_fund_df.columns:
+                    ttm_rev = macro_fund_df["_ttm_revenue"]
+                    shares = macro_fund_df["_shares_outstanding"]
+                    valid = ttm_rev.notna() & shares.notna() & (shares > 0) & (ttm_rev > 0) & close_for_mf.notna()
+                    rps = ttm_rev[valid] / shares[valid]
+                    macro_fund_df.loc[valid, "ps_ratio"] = close_for_mf[valid] / rps
+
+                if all(c in macro_fund_df.columns for c in ["_ttm_ebitda", "_shares_outstanding", "_total_liabilities", "_cash"]):
+                    shares = macro_fund_df["_shares_outstanding"]
+                    ttm_ebitda = macro_fund_df["_ttm_ebitda"]
+                    total_liab = macro_fund_df["_total_liabilities"].fillna(0)
+                    cash = macro_fund_df["_cash"].fillna(0)
+                    valid = shares.notna() & (shares > 0) & ttm_ebitda.notna() & (ttm_ebitda.abs() > 0) & close_for_mf.notna()
+                    market_cap = close_for_mf[valid] * shares[valid]
+                    ev = market_cap + total_liab[valid] - cash[valid]
+                    macro_fund_df.loc[valid, "ev_ebitda"] = ev / ttm_ebitda[valid]
+
+                try:
+                    spy_cache_file = Path("data/training_cache/SPY_daily.csv")
+                    if spy_cache_file.exists():
+                        spy_df = pd.read_csv(spy_cache_file, index_col=0, parse_dates=True)
+                    else:
+                        spy_df = get_historical_data("SPY", interval="daily", outputsize="full")
+                    if not spy_df.empty:
+                        spy_close = pd.to_numeric(spy_df["Close"], errors="coerce")
+                        spy_returns = spy_close.pct_change()
+                        stock_returns = close_prices_series.pct_change()
+                        aligned = pd.DataFrame({"stock": stock_returns, "spy": spy_returns}).dropna()
+                        if len(aligned) > 60:
+                            rolling_cov = aligned["stock"].rolling(252, min_periods=60).cov(aligned["spy"])
+                            rolling_var = aligned["spy"].rolling(252, min_periods=60).var()
+                            rolling_beta = rolling_cov / rolling_var.replace(0, np.nan)
+                            macro_fund_df["beta"] = rolling_beta.reindex(macro_fund_df.index).ffill()
+                except Exception as exc:
+                    if verbose:
+                        print(f"  [warn] beta computation failed: {exc}")
+
+                if "pe_ratio" in macro_fund_df.columns and "earnings_growth_yoy" in macro_fund_df.columns:
+                    pe = macro_fund_df["pe_ratio"]
+                    eg = macro_fund_df["earnings_growth_yoy"]
+                    eg_pct = eg * 100
+                    valid = pe.notna() & eg_pct.notna() & (eg_pct.abs() > 1.0) & (pe > 0)
+                    macro_fund_df.loc[valid, "peg_ratio"] = pe[valid] / eg_pct[valid]
+
+                for col in _INTERMEDIATE_COLS:
+                    if col in macro_fund_df.columns:
+                        macro_fund_df.drop(columns=[col], inplace=True)
+
+                n_mf = len(macro_fund_df)
+                n_mf_cols = sum(1 for c in macro_fund_cols if c in macro_fund_df.columns)
+                print(f"  [macro/fund] Loaded {n_mf} days, {n_mf_cols}/{len(macro_fund_cols)} features available")
+            else:
+                macro_fund_df = None
+        except Exception as exc:
+            print(f"  [warn] macro/fund fetch failed: {exc}")
+            macro_fund_df = None
 
     trade_log = []
     equity = 1.0
@@ -304,9 +401,24 @@ def run_stage2_backtest(
             t += horizon
             continue
 
+        # Compute real regime features
+        current_close = float(close_prices_arr[t])
+        regime_feats = compute_regime_from_features(features, current_close)
+
+        # Look up macro/fund features by date (backward fill)
+        mf_row = None
+        if macro_fund_df is not None and not macro_fund_df.empty:
+            valid_dates = macro_fund_df.index[macro_fund_df.index <= current_date]
+            if len(valid_dates) > 0:
+                nearest_date = valid_dates[-1]
+                mf_row = macro_fund_df.loc[nearest_date].to_dict()
+
         # Score (with uncertainty info for conformal filtering)
         raw_prob, prob, uncertainty_info = score_features(
-            features, model, meta, calibrator, return_uncertainty=True,
+            features, model, meta, calibrator,
+            regime_features=regime_feats,
+            macro_fund_row=mf_row,
+            return_uncertainty=True,
         )
 
         # Decision: simple threshold (same as Stage 1)
@@ -364,7 +476,7 @@ def run_stage2_backtest(
                 # Check intraday extremes for stop/TP triggers
                 day_high = high_prices[check_idx]
                 day_low = low_prices[check_idx]
-                day_close = close_prices[check_idx]
+                day_close = close_prices_arr[check_idx]
 
                 if np.isnan(day_high) or np.isnan(day_low) or np.isnan(day_close):
                     continue
@@ -403,7 +515,7 @@ def run_stage2_backtest(
             # If no stop/TP triggered, exit at horizon close
             if exit_price is None:
                 exit_idx = min(entry_idx + horizon, total_days - 1)
-                exit_price = close_prices[exit_idx]
+                exit_price = close_prices_arr[exit_idx]
                 exit_reason = "horizon"
 
             if np.isnan(exit_price) or exit_price <= 0:
@@ -530,13 +642,103 @@ def run_stage1_backtest(
 
     dates = data.index
     open_prices = pd.to_numeric(data["Open"], errors="coerce").values
-    close_prices = pd.to_numeric(data["Close"], errors="coerce").values
+    close_prices_arr = pd.to_numeric(data["Close"], errors="coerce").values
+    close_prices_series = pd.to_numeric(data["Close"], errors="coerce")
 
     start_idx = dates.searchsorted(pd.Timestamp(start_date))
     start_idx = max(start_idx, 60)
     total_days = len(dates)
 
     cost_per_trade = (cost_bps + slippage_bps) / 10000.0 * 2
+
+    # ── Pre-fetch macro/fundamental historical data (once) ──
+    macro_fund_cols = meta.get("macro_fundamental_features", [])
+    macro_fund_df = None
+    if macro_fund_cols:
+        try:
+            from utils.macro_fundamental_provider import MacroFundamentalFeatureProvider
+            provider = MacroFundamentalFeatureProvider(verbose=False)
+            mf_start = (pd.Timestamp(start_date) - pd.Timedelta(days=120)).to_pydatetime()
+            mf_end = pd.Timestamp(end_date).to_pydatetime()
+            macro_fund_df = provider.extract_historical(
+                stock_symbol=ticker,
+                start_date=mf_start,
+                end_date=mf_end,
+            )
+            if macro_fund_df is not None and not macro_fund_df.empty:
+                macro_fund_df = macro_fund_df.sort_index()
+                macro_fund_df.index = pd.to_datetime(macro_fund_df.index)
+
+                _INTERMEDIATE_COLS = [
+                    "_ttm_eps", "_ttm_revenue", "_ttm_ebitda", "_ttm_net_income",
+                    "_total_equity", "_shares_outstanding", "_total_liabilities", "_cash",
+                ]
+                close_for_mf = close_prices_series.reindex(macro_fund_df.index, method="ffill")
+
+                if "_ttm_eps" in macro_fund_df.columns:
+                    ttm_eps = macro_fund_df["_ttm_eps"]
+                    valid = ttm_eps.notna() & (ttm_eps.abs() > 0.01) & close_for_mf.notna()
+                    macro_fund_df.loc[valid, "pe_ratio"] = close_for_mf[valid] / ttm_eps[valid]
+
+                if "_total_equity" in macro_fund_df.columns and "_shares_outstanding" in macro_fund_df.columns:
+                    equity_col = macro_fund_df["_total_equity"]
+                    shares = macro_fund_df["_shares_outstanding"]
+                    valid = equity_col.notna() & shares.notna() & (shares > 0) & close_for_mf.notna()
+                    bvps = equity_col[valid] / shares[valid]
+                    bvps_valid = bvps.abs() > 0.01
+                    final_idx = bvps_valid.index[bvps_valid]
+                    macro_fund_df.loc[final_idx, "pb_ratio"] = close_for_mf[final_idx] / bvps[bvps_valid]
+
+                if "_ttm_revenue" in macro_fund_df.columns and "_shares_outstanding" in macro_fund_df.columns:
+                    ttm_rev = macro_fund_df["_ttm_revenue"]
+                    shares = macro_fund_df["_shares_outstanding"]
+                    valid = ttm_rev.notna() & shares.notna() & (shares > 0) & (ttm_rev > 0) & close_for_mf.notna()
+                    rps = ttm_rev[valid] / shares[valid]
+                    macro_fund_df.loc[valid, "ps_ratio"] = close_for_mf[valid] / rps
+
+                if all(c in macro_fund_df.columns for c in ["_ttm_ebitda", "_shares_outstanding", "_total_liabilities", "_cash"]):
+                    shares = macro_fund_df["_shares_outstanding"]
+                    ttm_ebitda = macro_fund_df["_ttm_ebitda"]
+                    total_liab = macro_fund_df["_total_liabilities"].fillna(0)
+                    cash = macro_fund_df["_cash"].fillna(0)
+                    valid = shares.notna() & (shares > 0) & ttm_ebitda.notna() & (ttm_ebitda.abs() > 0) & close_for_mf.notna()
+                    market_cap = close_for_mf[valid] * shares[valid]
+                    ev = market_cap + total_liab[valid] - cash[valid]
+                    macro_fund_df.loc[valid, "ev_ebitda"] = ev / ttm_ebitda[valid]
+
+                try:
+                    spy_cache_file = Path("data/training_cache/SPY_daily.csv")
+                    if spy_cache_file.exists():
+                        spy_df = pd.read_csv(spy_cache_file, index_col=0, parse_dates=True)
+                    else:
+                        spy_df = get_historical_data("SPY", interval="daily", outputsize="full")
+                    if not spy_df.empty:
+                        spy_close = pd.to_numeric(spy_df["Close"], errors="coerce")
+                        spy_returns = spy_close.pct_change()
+                        stock_returns = close_prices_series.pct_change()
+                        aligned = pd.DataFrame({"stock": stock_returns, "spy": spy_returns}).dropna()
+                        if len(aligned) > 60:
+                            rolling_cov = aligned["stock"].rolling(252, min_periods=60).cov(aligned["spy"])
+                            rolling_var = aligned["spy"].rolling(252, min_periods=60).var()
+                            rolling_beta = rolling_cov / rolling_var.replace(0, np.nan)
+                            macro_fund_df["beta"] = rolling_beta.reindex(macro_fund_df.index).ffill()
+                except Exception:
+                    pass
+
+                if "pe_ratio" in macro_fund_df.columns and "earnings_growth_yoy" in macro_fund_df.columns:
+                    pe = macro_fund_df["pe_ratio"]
+                    eg = macro_fund_df["earnings_growth_yoy"]
+                    eg_pct = eg * 100
+                    valid = pe.notna() & eg_pct.notna() & (eg_pct.abs() > 1.0) & (pe > 0)
+                    macro_fund_df.loc[valid, "peg_ratio"] = pe[valid] / eg_pct[valid]
+
+                for col in _INTERMEDIATE_COLS:
+                    if col in macro_fund_df.columns:
+                        macro_fund_df.drop(columns=[col], inplace=True)
+            else:
+                macro_fund_df = None
+        except Exception:
+            macro_fund_df = None
 
     trade_log = []
     equity = 1.0
@@ -551,7 +753,23 @@ def run_stage1_backtest(
             t += horizon
             continue
 
-        raw_prob, prob = score_features(features, model, meta, calibrator)
+        # Compute real regime features
+        current_close = float(close_prices_arr[t])
+        regime_feats = compute_regime_from_features(features, current_close)
+
+        # Look up macro/fund features by date
+        mf_row = None
+        if macro_fund_df is not None and not macro_fund_df.empty:
+            valid_dates = macro_fund_df.index[macro_fund_df.index <= current_date]
+            if len(valid_dates) > 0:
+                nearest_date = valid_dates[-1]
+                mf_row = macro_fund_df.loc[nearest_date].to_dict()
+
+        raw_prob, prob = score_features(
+            features, model, meta, calibrator,
+            regime_features=regime_feats,
+            macro_fund_row=mf_row,
+        )
 
         if prob > buy_threshold:
             action = "buy"
@@ -566,7 +784,7 @@ def run_stage1_backtest(
         if direction != 0.0 and t + 1 < total_days:
             entry_price = open_prices[t + 1]
             exit_idx = min(t + 1 + horizon, total_days - 1)
-            exit_price = close_prices[exit_idx]
+            exit_price = close_prices_arr[exit_idx]
 
             if np.isnan(entry_price) or np.isnan(exit_price) or entry_price <= 0:
                 t += horizon

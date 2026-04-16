@@ -49,6 +49,7 @@ from dotenv import load_dotenv
 # Reuse Stage 1 utilities
 from debug_stage1_forecast_only import (
     compute_features,
+    compute_regime_from_features,
     load_model,
     score_features,
     analyze_backtest,
@@ -125,11 +126,14 @@ def score_features_with_regime(
     use_real_regime: bool = True,
     return_uncertainty: bool = False,
     macro_snapshot: Optional[Dict[str, Any]] = None,
+    close_price: float = 0.0,
 ) -> tuple:
     """Score features with LightGBM, optionally injecting real regime features.
 
     When use_real_regime=True (Path ④ enabled), regime features come from
     RegimeAgent's actual output instead of neutral defaults (all zeros).
+    When use_real_regime=False, regime features come from
+    compute_regime_from_features() (same as Stage 2 baseline).
 
     Args:
         features: Base technical features from compute_features().
@@ -137,8 +141,9 @@ def score_features_with_regime(
         model: LightGBM Booster.
         meta: Model metadata dict.
         calibrator: Isotonic calibrator (or None).
-        use_real_regime: If True, use real regime features; if False, use zeros.
+        use_real_regime: If True, use RegimeAgent regime features; if False, use compute_regime_from_features.
         return_uncertainty: If True, return uncertainty info as 3rd element.
+        close_price: Current close price (needed for compute_regime_from_features when use_real_regime=False).
 
     Returns:
         (raw_prob, calibrated_prob) or (raw_prob, calibrated_prob, uncertainty_info)
@@ -155,16 +160,18 @@ def score_features_with_regime(
     for col in feature_cols:
         row[col] = features.get(col, 0.0)
 
-    # Regime features: real or neutral
+    # Regime features: RegimeAgent output or compute_regime_from_features baseline
     if use_real_regime and regime_cols:
         regime_feats = encode_regime_features(regime)
         for col in regime_cols:
             row[col] = regime_feats.get(col, 0.0)
     else:
+        # Use compute_regime_from_features (same as Stage 2 baseline)
+        baseline_regime_feats = compute_regime_from_features(features, close_price) if close_price > 0 else {}
         for col in regime_cols:
-            row[col] = 0.0  # neutral defaults
+            row[col] = baseline_regime_feats.get(col, 0.0)
 
-    # Macro/fundamental: use real historical data if available
+    # Macro/fundamental: use real historical data if available (NaN for missing, not 0.0)
     if macro_snapshot and macro_fund_cols:
         macro_feats = macro_snapshot.get("macro_features", {})
         fund_feats = macro_snapshot.get("fundamental_features", {})
@@ -172,10 +179,10 @@ def score_features_with_regime(
             val = macro_feats.get(col) if macro_feats else None
             if val is None and fund_feats:
                 val = fund_feats.get(col)
-            row[col] = float(val) if val is not None else 0.0
+            row[col] = float(val) if val is not None else np.nan
     else:
         for col in macro_fund_cols:
-            row[col] = 0.0
+            row[col] = np.nan
     # Rank features: median default
     for col in rank_cols:
         row[col] = 0.5
@@ -248,7 +255,7 @@ def score_features_with_regime(
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Kelly defaults
-KELLY_AVG_WIN = 0.03
+KELLY_AVG_WIN = 0.09
 KELLY_AVG_LOSS = 0.02
 
 # Position limits
@@ -665,6 +672,9 @@ def run_stage3_backtest(
         )
 
         # ── Score with regime features (Path ④) ─────────────────────────
+        # Get current close price for regime feature computation
+        current_close = float(close_prices[t])
+
         raw_prob, prob, uncertainty_info = score_features_with_regime(
             features=features,
             regime=regime,
@@ -674,11 +684,27 @@ def run_stage3_backtest(
             use_real_regime=enable_regime_features,
             return_uncertainty=True,
             macro_snapshot=macro_snapshot,
+            close_price=current_close,
         )
 
         # Track probability difference for Path ④ analysis
         if enable_regime_features:
-            _, prob_baseline = score_features(features, model, meta, calibrator)
+            # Baseline uses compute_regime_from_features (same as v0)
+            baseline_regime_feats = compute_regime_from_features(features, current_close)
+            mf_row = None
+            if macro_snapshot:
+                mf_row = {}
+                mf = macro_snapshot.get("macro_features", {})
+                ff = macro_snapshot.get("fundamental_features", {})
+                if mf:
+                    mf_row.update({k: v for k, v in mf.items() if v is not None})
+                if ff:
+                    mf_row.update({k: v for k, v in ff.items() if v is not None})
+            _, prob_baseline = score_features(
+                features, model, meta, calibrator,
+                regime_features=baseline_regime_feats,
+                macro_fund_row=mf_row,
+            )
             prob_diff = prob - prob_baseline
             regime_stats["regime_prob_diffs"].append(
                 (regime_state, round(prob_diff, 6))
@@ -1226,17 +1252,102 @@ def main():
     print(f"  [✓] RegimeAgent initialized")
 
     # Initialize MacroFundamentalFeatureProvider and load historical data
+    # (mirrors Stage 2: compute derived features like pe_ratio, beta, etc.)
     print(f"\n── Loading historical macro/fundamental data ──")
     macro_snapshots = {}
     try:
         from datetime import datetime as _dt
+        from utils.yfinance_cache import get_historical_data as _get_hist
+
         macro_provider = MacroFundamentalFeatureProvider(verbose=args.verbose)
+        mf_start = _dt.strptime(args.start, "%Y-%m-%d") - pd.Timedelta(days=120)
+        mf_end = _dt.strptime(args.end, "%Y-%m-%d")
         hist_df = macro_provider.extract_historical(
             stock_symbol=ticker,
-            start_date=_dt.strptime(args.start, "%Y-%m-%d"),
-            end_date=_dt.strptime(args.end, "%Y-%m-%d"),
+            start_date=mf_start,
+            end_date=mf_end,
         )
         if hist_df is not None and not hist_df.empty:
+            hist_df = hist_df.sort_index()
+            hist_df.index = pd.to_datetime(hist_df.index)
+
+            # ── Compute derived features (same as Stage 2) ──────────────
+            _INTERMEDIATE_COLS = [
+                "_ttm_eps", "_ttm_revenue", "_ttm_ebitda", "_ttm_net_income",
+                "_total_equity", "_shares_outstanding", "_total_liabilities", "_cash",
+            ]
+
+            # Get close prices for price-dependent features
+            _price_data = _get_hist(ticker, interval="daily", outputsize="full")
+            if not isinstance(_price_data.index, pd.DatetimeIndex):
+                _price_data.index = pd.to_datetime(_price_data.index)
+            _close_series = pd.to_numeric(_price_data["Close"], errors="coerce")
+            close_for_mf = _close_series.reindex(hist_df.index, method="ffill")
+
+            if "_ttm_eps" in hist_df.columns:
+                ttm_eps = hist_df["_ttm_eps"]
+                valid = ttm_eps.notna() & (ttm_eps.abs() > 0.01) & close_for_mf.notna()
+                hist_df.loc[valid, "pe_ratio"] = close_for_mf[valid] / ttm_eps[valid]
+
+            if "_total_equity" in hist_df.columns and "_shares_outstanding" in hist_df.columns:
+                equity_col = hist_df["_total_equity"]
+                shares = hist_df["_shares_outstanding"]
+                valid = equity_col.notna() & shares.notna() & (shares > 0) & close_for_mf.notna()
+                bvps = equity_col[valid] / shares[valid]
+                bvps_valid = bvps.abs() > 0.01
+                final_idx = bvps_valid.index[bvps_valid]
+                hist_df.loc[final_idx, "pb_ratio"] = close_for_mf[final_idx] / bvps[bvps_valid]
+
+            if "_ttm_revenue" in hist_df.columns and "_shares_outstanding" in hist_df.columns:
+                ttm_rev = hist_df["_ttm_revenue"]
+                shares = hist_df["_shares_outstanding"]
+                valid = ttm_rev.notna() & shares.notna() & (shares > 0) & (ttm_rev > 0) & close_for_mf.notna()
+                rps = ttm_rev[valid] / shares[valid]
+                hist_df.loc[valid, "ps_ratio"] = close_for_mf[valid] / rps
+
+            if all(c in hist_df.columns for c in ["_ttm_ebitda", "_shares_outstanding", "_total_liabilities", "_cash"]):
+                shares = hist_df["_shares_outstanding"]
+                ttm_ebitda = hist_df["_ttm_ebitda"]
+                total_liab = hist_df["_total_liabilities"].fillna(0)
+                cash = hist_df["_cash"].fillna(0)
+                valid = shares.notna() & (shares > 0) & ttm_ebitda.notna() & (ttm_ebitda.abs() > 0) & close_for_mf.notna()
+                market_cap = close_for_mf[valid] * shares[valid]
+                ev = market_cap + total_liab[valid] - cash[valid]
+                hist_df.loc[valid, "ev_ebitda"] = ev / ttm_ebitda[valid]
+
+            try:
+                spy_cache_file = Path("data/training_cache/SPY_daily.csv")
+                if spy_cache_file.exists():
+                    spy_df = pd.read_csv(spy_cache_file, index_col=0, parse_dates=True)
+                else:
+                    spy_df = _get_hist("SPY", interval="daily", outputsize="full")
+                if not spy_df.empty:
+                    spy_close = pd.to_numeric(spy_df["Close"], errors="coerce")
+                    spy_returns = spy_close.pct_change()
+                    stock_returns = _close_series.pct_change()
+                    aligned = pd.DataFrame({"stock": stock_returns, "spy": spy_returns}).dropna()
+                    if len(aligned) > 60:
+                        rolling_cov = aligned["stock"].rolling(252, min_periods=60).cov(aligned["spy"])
+                        rolling_var = aligned["spy"].rolling(252, min_periods=60).var()
+                        rolling_beta = rolling_cov / rolling_var.replace(0, np.nan)
+                        hist_df["beta"] = rolling_beta.reindex(hist_df.index).ffill()
+            except Exception as exc:
+                if args.verbose:
+                    print(f"  [warn] beta computation failed: {exc}")
+
+            if "pe_ratio" in hist_df.columns and "earnings_growth_yoy" in hist_df.columns:
+                pe = hist_df["pe_ratio"]
+                eg = hist_df["earnings_growth_yoy"]
+                eg_pct = eg * 100
+                valid = pe.notna() & eg_pct.notna() & (eg_pct.abs() > 1.0) & (pe > 0)
+                hist_df.loc[valid, "peg_ratio"] = pe[valid] / eg_pct[valid]
+
+            # Drop intermediate columns
+            for col in _INTERMEDIATE_COLS:
+                if col in hist_df.columns:
+                    hist_df.drop(columns=[col], inplace=True)
+
+            # Convert to macro_snapshots dict format
             for date_idx, row in hist_df.iterrows():
                 date_key = str(date_idx)[:10]
                 macro_feats = {}
@@ -1252,11 +1363,13 @@ def main():
                     "macro_features": macro_feats,
                     "fundamental_features": fund_feats,
                 }
-            print(f"  [✓] Loaded {len(macro_snapshots)} daily macro snapshots")
+            print(f"  [✓] Loaded {len(macro_snapshots)} daily macro snapshots (with derived features)")
         else:
             print(f"  [⚠] Historical macro data returned empty")
     except Exception as exc:
+        import traceback
         print(f"  [⚠] Failed to load macro data: {exc}")
+        traceback.print_exc()
         print(f"  [⚠] Falling back to macro_features=None (same as before)")
 
     # Run each round

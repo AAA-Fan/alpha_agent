@@ -41,6 +41,146 @@ if project_root not in sys.path:
 from dotenv import load_dotenv
 
 
+# ── Regime computation helpers (mirroring train pipeline) ────────────────
+
+def _trend_score_from_features(features: dict) -> float:
+    """Compute trend score from feature dict (mirrors training pipeline)."""
+    score = 0.0
+    weights = {
+        "sma_20_ratio": 2.0,
+        "sma_50_ratio": 1.5,
+        "momentum_20": 1.2,
+        "macd_hist": 0.8,
+    }
+    for key, w in weights.items():
+        val = features.get(key, 0.0)
+        if val is not None and not (isinstance(val, float) and np.isnan(val)):
+            score += w * float(val)
+    return score
+
+
+def _classify_trend(score: float, m5: float) -> str:
+    if score > 0.05 and m5 > 0:
+        return "strong_uptrend"
+    if score > 0.02:
+        return "uptrend"
+    if score < -0.05 and m5 < 0:
+        return "strong_downtrend"
+    if score < -0.02:
+        return "downtrend"
+    return "sideways"
+
+
+def _trend_strength(score: float) -> float:
+    return min(1.0, abs(score) / 0.10)
+
+
+def _classify_volatility(annualized_vol: float) -> str:
+    if annualized_vol is None or (isinstance(annualized_vol, float) and np.isnan(annualized_vol)):
+        return "unknown"
+    if annualized_vol >= 0.50:
+        return "extreme"
+    if annualized_vol >= 0.35:
+        return "high"
+    if annualized_vol <= 0.16:
+        return "low"
+    return "normal"
+
+
+def _is_vol_expanding(vol_20: float, atr_14: float, price: float) -> bool:
+    if any(v is None or (isinstance(v, float) and np.isnan(v)) for v in [vol_20, atr_14, price]):
+        return False
+    if price <= 0:
+        return False
+    atr_daily_pct = atr_14 / price
+    atr_annualized = atr_daily_pct * (252 ** 0.5)
+    return vol_20 > atr_annualized * 1.20
+
+
+def _classify_momentum_health(m5: float, m20: float, rsi: float, trend: str) -> str:
+    trend_is_up = trend in ("uptrend", "strong_uptrend")
+    trend_is_down = trend in ("downtrend", "strong_downtrend")
+    if rsi > 75 and trend_is_up and m5 < 0:
+        return "exhausted"
+    if rsi < 25 and trend_is_down and m5 > 0:
+        return "exhausted"
+    same_direction = (m5 >= 0 and m20 >= 0) or (m5 < 0 and m20 < 0)
+    if same_direction:
+        if abs(m5) > abs(m20):
+            return "accelerating"
+        return "steady"
+    return "decelerating"
+
+
+def _drawdown_severity(dd: float) -> str:
+    if dd is None or (isinstance(dd, float) and np.isnan(dd)):
+        return "none"
+    if dd <= -0.20:
+        return "severe"
+    if dd <= -0.10:
+        return "moderate"
+    if dd <= -0.03:
+        return "mild"
+    return "none"
+
+
+def _build_state(trend: str, vol_regime: str, momentum_health: str, dd_severity: str) -> str:
+    high_vol = vol_regime in ("high", "extreme")
+    if trend == "strong_downtrend" and high_vol and dd_severity in ("severe", "moderate"):
+        return "capitulation"
+    if trend == "strong_uptrend" and momentum_health != "exhausted" and vol_regime != "extreme":
+        return "strong_rally"
+    if trend in ("uptrend", "strong_uptrend") and momentum_health in ("decelerating", "exhausted"):
+        return "topping_out"
+    if trend in ("uptrend", "strong_uptrend") and momentum_health in ("accelerating", "steady"):
+        return "trending_up"
+    if trend in ("downtrend", "strong_downtrend") and momentum_health in ("decelerating", "exhausted"):
+        return "bottoming_out"
+    if trend in ("downtrend", "strong_downtrend") and momentum_health in ("accelerating", "steady"):
+        return "trending_down"
+    if trend == "sideways" and high_vol:
+        return "choppy"
+    if trend == "sideways" and vol_regime == "low":
+        return "coiling"
+    return "range_bound"
+
+
+_HEALTH_MAP = {"accelerating": 0, "steady": 1, "decelerating": 2, "exhausted": 3}
+_STATE_DIRECTION = {
+    "strong_rally": 2, "trending_up": 1, "topping_out": 0,
+    "range_bound": 0, "coiling": 0, "choppy": -1,
+    "trending_down": -1, "bottoming_out": 0, "capitulation": -2,
+}
+_VOL_REGIME_ORD = {"low": 0, "normal": 1, "high": 2, "extreme": 3, "unknown": 1}
+
+
+def compute_regime_from_features(features: dict, close_price: float) -> dict:
+    """Compute regime features from base features dict (no DataFrame needed)."""
+    m5 = features.get("momentum_5", 0.0)
+    m20 = features.get("momentum_20", 0.0)
+    rsi = features.get("rsi_14", 50.0)
+    vol_20 = features.get("volatility_20", 0.25)
+    atr_14 = features.get("atr_14", 0.0)
+    dd_60 = features.get("drawdown_60", 0.0)
+
+    ts = _trend_score_from_features(features)
+    trend = _classify_trend(ts, m5)
+    strength = _trend_strength(ts)
+    vol_regime = _classify_volatility(vol_20)
+    vol_exp = _is_vol_expanding(vol_20, atr_14, close_price)
+    mom_health = _classify_momentum_health(m5, m20, rsi, trend)
+    dd_sev = _drawdown_severity(dd_60)
+    state = _build_state(trend, vol_regime, mom_health, dd_sev)
+
+    return {
+        "regime_direction": _STATE_DIRECTION.get(state, 0),
+        "regime_volatility_ord": _VOL_REGIME_ORD.get(vol_regime, 1),
+        "trend_strength": strength,
+        "vol_expanding": int(vol_exp),
+        "momentum_health_enc": _HEALTH_MAP.get(mom_health, 1),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. Feature computation (same as Stage 0 — standalone, no Agent dependency)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -171,6 +311,8 @@ def score_features(
     model,
     meta: dict,
     calibrator,
+    regime_features: dict | None = None,
+    macro_fund_row: dict | None = None,
     return_uncertainty: bool = False,
 ) -> tuple:
     """Score features with LightGBM model and return (raw_prob, calibrated_prob).
@@ -178,8 +320,8 @@ def score_features(
     If return_uncertainty=True, returns (raw_prob, prob, uncertainty_info) where
     uncertainty_info is a dict with keys: uncertainty, prediction_set, is_uncertain.
 
-    Regime, macro/fundamental, rank, and categorical features are set to
-    neutral defaults since we're bypassing those agents.
+    Regime and macro/fundamental features are now passed in from the caller
+    (computed from real data), with fallback to neutral defaults.
     """
     feature_cols = meta.get("feature_columns", [])
     regime_cols = meta.get("regime_features", [])
@@ -191,10 +333,15 @@ def score_features(
     row = {}
     for col in feature_cols:
         row[col] = features.get(col, 0.0)
+    # Regime features: use real values if provided, else neutral defaults
     for col in regime_cols:
-        row[col] = 0.0  # neutral regime
+        row[col] = regime_features.get(col, 0.0) if regime_features else 0.0
+    # Macro/fund features: use real values if provided, else NaN (LightGBM handles natively)
     for col in macro_fund_cols:
-        row[col] = 0.0  # no macro data
+        if macro_fund_row and col in macro_fund_row and pd.notna(macro_fund_row[col]):
+            row[col] = float(macro_fund_row[col])
+        else:
+            row[col] = np.nan
     for col in rank_cols:
         row[col] = 0.5  # median rank
     for col in cat_cols:
@@ -309,13 +456,118 @@ def run_stage1_backtest(
 
     dates = data.index
     open_prices = pd.to_numeric(data["Open"], errors="coerce").values
-    close_prices = pd.to_numeric(data["Close"], errors="coerce").values
+    close_prices_arr = pd.to_numeric(data["Close"], errors="coerce").values
+    close_prices_series = pd.to_numeric(data["Close"], errors="coerce")
 
     start_idx = dates.searchsorted(pd.Timestamp(start_date))
     start_idx = max(start_idx, 60)
     total_days = len(dates)
 
     cost_per_trade = (cost_bps + slippage_bps) / 10000.0 * 2  # round-trip
+
+    # ── Pre-fetch macro/fundamental historical data (once) ──
+    macro_fund_cols = meta.get("macro_fundamental_features", [])
+    macro_fund_df = None
+    if macro_fund_cols:
+        try:
+            from utils.macro_fundamental_provider import MacroFundamentalFeatureProvider
+            provider = MacroFundamentalFeatureProvider(verbose=verbose)
+            mf_start = (pd.Timestamp(start_date) - pd.Timedelta(days=120)).to_pydatetime()
+            mf_end = pd.Timestamp(end_date).to_pydatetime()
+            macro_fund_df = provider.extract_historical(
+                stock_symbol=ticker,
+                start_date=mf_start,
+                end_date=mf_end,
+            )
+            if macro_fund_df is not None and not macro_fund_df.empty:
+                macro_fund_df = macro_fund_df.sort_index()
+                macro_fund_df.index = pd.to_datetime(macro_fund_df.index)
+
+                # Compute price-dependent features
+                _INTERMEDIATE_COLS = [
+                    "_ttm_eps", "_ttm_revenue", "_ttm_ebitda", "_ttm_net_income",
+                    "_total_equity", "_shares_outstanding", "_total_liabilities", "_cash",
+                ]
+                close_for_mf = close_prices_series.reindex(macro_fund_df.index, method="ffill")
+
+                # P/E ratio
+                if "_ttm_eps" in macro_fund_df.columns:
+                    ttm_eps = macro_fund_df["_ttm_eps"]
+                    valid = ttm_eps.notna() & (ttm_eps.abs() > 0.01) & close_for_mf.notna()
+                    macro_fund_df.loc[valid, "pe_ratio"] = close_for_mf[valid] / ttm_eps[valid]
+
+                # P/B ratio
+                if "_total_equity" in macro_fund_df.columns and "_shares_outstanding" in macro_fund_df.columns:
+                    equity_col = macro_fund_df["_total_equity"]
+                    shares = macro_fund_df["_shares_outstanding"]
+                    valid = equity_col.notna() & shares.notna() & (shares > 0) & close_for_mf.notna()
+                    bvps = equity_col[valid] / shares[valid]
+                    bvps_valid = bvps.abs() > 0.01
+                    final_idx = bvps_valid.index[bvps_valid]
+                    macro_fund_df.loc[final_idx, "pb_ratio"] = close_for_mf[final_idx] / bvps[bvps_valid]
+
+                # P/S ratio
+                if "_ttm_revenue" in macro_fund_df.columns and "_shares_outstanding" in macro_fund_df.columns:
+                    ttm_rev = macro_fund_df["_ttm_revenue"]
+                    shares = macro_fund_df["_shares_outstanding"]
+                    valid = ttm_rev.notna() & shares.notna() & (shares > 0) & (ttm_rev > 0) & close_for_mf.notna()
+                    rps = ttm_rev[valid] / shares[valid]
+                    macro_fund_df.loc[valid, "ps_ratio"] = close_for_mf[valid] / rps
+
+                # EV/EBITDA
+                if all(c in macro_fund_df.columns for c in ["_ttm_ebitda", "_shares_outstanding", "_total_liabilities", "_cash"]):
+                    shares = macro_fund_df["_shares_outstanding"]
+                    ttm_ebitda = macro_fund_df["_ttm_ebitda"]
+                    total_liab = macro_fund_df["_total_liabilities"].fillna(0)
+                    cash = macro_fund_df["_cash"].fillna(0)
+                    valid = shares.notna() & (shares > 0) & ttm_ebitda.notna() & (ttm_ebitda.abs() > 0) & close_for_mf.notna()
+                    market_cap = close_for_mf[valid] * shares[valid]
+                    ev = market_cap + total_liab[valid] - cash[valid]
+                    macro_fund_df.loc[valid, "ev_ebitda"] = ev / ttm_ebitda[valid]
+
+                # Beta (rolling 252d)
+                try:
+                    spy_cache_file = Path("data/training_cache/SPY_daily.csv")
+                    if spy_cache_file.exists():
+                        spy_df = pd.read_csv(spy_cache_file, index_col=0, parse_dates=True)
+                    else:
+                        spy_df = get_historical_data("SPY", interval="daily", outputsize="full")
+                    if not spy_df.empty:
+                        spy_close = pd.to_numeric(spy_df["Close"], errors="coerce")
+                        spy_returns = spy_close.pct_change()
+                        stock_returns = close_prices_series.pct_change()
+                        aligned = pd.DataFrame({"stock": stock_returns, "spy": spy_returns}).dropna()
+                        if len(aligned) > 60:
+                            rolling_cov = aligned["stock"].rolling(252, min_periods=60).cov(aligned["spy"])
+                            rolling_var = aligned["spy"].rolling(252, min_periods=60).var()
+                            rolling_beta = rolling_cov / rolling_var.replace(0, np.nan)
+                            macro_fund_df["beta"] = rolling_beta.reindex(macro_fund_df.index).ffill()
+                except Exception as exc:
+                    if verbose:
+                        print(f"  [warn] beta computation failed: {exc}")
+
+                # PEG ratio
+                if "pe_ratio" in macro_fund_df.columns and "earnings_growth_yoy" in macro_fund_df.columns:
+                    pe = macro_fund_df["pe_ratio"]
+                    eg = macro_fund_df["earnings_growth_yoy"]
+                    eg_pct = eg * 100
+                    valid = pe.notna() & eg_pct.notna() & (eg_pct.abs() > 1.0) & (pe > 0)
+                    macro_fund_df.loc[valid, "peg_ratio"] = pe[valid] / eg_pct[valid]
+
+                # Drop intermediate columns
+                for col in _INTERMEDIATE_COLS:
+                    if col in macro_fund_df.columns:
+                        macro_fund_df.drop(columns=[col], inplace=True)
+
+                n_mf = len(macro_fund_df)
+                n_mf_cols = sum(1 for c in macro_fund_cols if c in macro_fund_df.columns)
+                print(f"  [macro/fund] Loaded {n_mf} days, {n_mf_cols}/{len(macro_fund_cols)} features available")
+            else:
+                print("  [warn] macro/fund data empty, using NaN")
+                macro_fund_df = None
+        except Exception as exc:
+            print(f"  [warn] macro/fund fetch failed: {exc}, using NaN")
+            macro_fund_df = None
 
     trade_log = []
     equity = 1.0
@@ -335,8 +587,24 @@ def run_stage1_backtest(
             t += horizon
             continue
 
-        # Score
-        raw_prob, prob = score_features(features, model, meta, calibrator)
+        # Compute real regime features
+        current_close = float(close_prices_arr[t])
+        regime_feats = compute_regime_from_features(features, current_close)
+
+        # Look up macro/fund features by date (backward fill)
+        mf_row = None
+        if macro_fund_df is not None and not macro_fund_df.empty:
+            valid_dates = macro_fund_df.index[macro_fund_df.index <= current_date]
+            if len(valid_dates) > 0:
+                nearest_date = valid_dates[-1]
+                mf_row = macro_fund_df.loc[nearest_date].to_dict()
+
+        # Score with real regime + macro/fund features
+        raw_prob, prob = score_features(
+            features, model, meta, calibrator,
+            regime_features=regime_feats,
+            macro_fund_row=mf_row,
+        )
 
         # Decision: simple threshold
         if prob > buy_threshold:
@@ -353,7 +621,7 @@ def run_stage1_backtest(
         if direction != 0.0 and t + 1 < total_days:
             entry_price = open_prices[t + 1]
             exit_idx = min(t + 1 + horizon, total_days - 1)
-            exit_price = close_prices[exit_idx]
+            exit_price = close_prices_arr[exit_idx]
 
             if np.isnan(entry_price) or np.isnan(exit_price) or entry_price <= 0:
                 t += horizon

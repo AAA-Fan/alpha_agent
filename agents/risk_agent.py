@@ -13,7 +13,7 @@ import os
 from typing import Any, Dict, Optional
 
 # ── Kelly defaults (used when MemoryAgent has insufficient data) ─────────
-DEFAULT_AVG_WIN = 0.03
+DEFAULT_AVG_WIN = 0.09
 DEFAULT_AVG_LOSS = 0.02
 MIN_KELLY_SAMPLES = 20
 

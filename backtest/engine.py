@@ -149,9 +149,11 @@ class BacktestEngine:
         _mfp._CACHE_TTL_DAYS = max(original_ttl, 365)
 
         try:
+            # Extend start date for warmup (beta needs 252 days of history)
+            extended_start = start_dt - pd.Timedelta(days=120)
             hist_df = self.macro_fund_provider.extract_historical(
                 stock_symbol=ticker,
-                start_date=start_dt,
+                start_date=extended_start,
                 end_date=end_dt,
             )
 
@@ -160,6 +162,85 @@ class BacktestEngine:
                     MACRO_FEATURE_COLUMNS,
                     FUNDAMENTAL_FEATURE_COLUMNS,
                 )
+
+                hist_df = hist_df.sort_index()
+                hist_df.index = pd.to_datetime(hist_df.index)
+
+                # ── Compute derived features (same as Stage 2/3) ────────
+                _INTERMEDIATE_COLS = [
+                    "_ttm_eps", "_ttm_revenue", "_ttm_ebitda", "_ttm_net_income",
+                    "_total_equity", "_shares_outstanding", "_total_liabilities", "_cash",
+                ]
+
+                # Get close prices for price-dependent features
+                price_data = get_historical_data(ticker, interval="daily", outputsize="full")
+                if not isinstance(price_data.index, pd.DatetimeIndex):
+                    price_data.index = pd.to_datetime(price_data.index)
+                close_series = pd.to_numeric(price_data["Close"], errors="coerce")
+                close_for_mf = close_series.reindex(hist_df.index, method="ffill")
+
+                if "_ttm_eps" in hist_df.columns:
+                    ttm_eps = hist_df["_ttm_eps"]
+                    valid = ttm_eps.notna() & (ttm_eps.abs() > 0.01) & close_for_mf.notna()
+                    hist_df.loc[valid, "pe_ratio"] = close_for_mf[valid] / ttm_eps[valid]
+
+                if "_total_equity" in hist_df.columns and "_shares_outstanding" in hist_df.columns:
+                    equity_col = hist_df["_total_equity"]
+                    shares = hist_df["_shares_outstanding"]
+                    valid = equity_col.notna() & shares.notna() & (shares > 0) & close_for_mf.notna()
+                    bvps = equity_col[valid] / shares[valid]
+                    bvps_valid = bvps.abs() > 0.01
+                    final_idx = bvps_valid.index[bvps_valid]
+                    hist_df.loc[final_idx, "pb_ratio"] = close_for_mf[final_idx] / bvps[bvps_valid]
+
+                if "_ttm_revenue" in hist_df.columns and "_shares_outstanding" in hist_df.columns:
+                    ttm_rev = hist_df["_ttm_revenue"]
+                    shares = hist_df["_shares_outstanding"]
+                    valid = ttm_rev.notna() & shares.notna() & (shares > 0) & (ttm_rev > 0) & close_for_mf.notna()
+                    rps = ttm_rev[valid] / shares[valid]
+                    hist_df.loc[valid, "ps_ratio"] = close_for_mf[valid] / rps
+
+                if all(c in hist_df.columns for c in ["_ttm_ebitda", "_shares_outstanding", "_total_liabilities", "_cash"]):
+                    shares = hist_df["_shares_outstanding"]
+                    ttm_ebitda = hist_df["_ttm_ebitda"]
+                    total_liab = hist_df["_total_liabilities"].fillna(0)
+                    cash = hist_df["_cash"].fillna(0)
+                    valid = shares.notna() & (shares > 0) & ttm_ebitda.notna() & (ttm_ebitda.abs() > 0) & close_for_mf.notna()
+                    market_cap = close_for_mf[valid] * shares[valid]
+                    ev = market_cap + total_liab[valid] - cash[valid]
+                    hist_df.loc[valid, "ev_ebitda"] = ev / ttm_ebitda[valid]
+
+                try:
+                    from pathlib import Path as _Path
+                    spy_cache_file = _Path("data/training_cache/SPY_daily.csv")
+                    if spy_cache_file.exists():
+                        spy_df = pd.read_csv(spy_cache_file, index_col=0, parse_dates=True)
+                    else:
+                        spy_df = get_historical_data("SPY", interval="daily", outputsize="full")
+                    if not spy_df.empty:
+                        spy_close = pd.to_numeric(spy_df["Close"], errors="coerce")
+                        spy_returns = spy_close.pct_change()
+                        stock_returns = close_series.pct_change()
+                        aligned = pd.DataFrame({"stock": stock_returns, "spy": spy_returns}).dropna()
+                        if len(aligned) > 60:
+                            rolling_cov = aligned["stock"].rolling(252, min_periods=60).cov(aligned["spy"])
+                            rolling_var = aligned["spy"].rolling(252, min_periods=60).var()
+                            rolling_beta = rolling_cov / rolling_var.replace(0, np.nan)
+                            hist_df["beta"] = rolling_beta.reindex(hist_df.index).ffill()
+                except Exception as exc:
+                    self._log(f"[backtest] beta computation failed: {exc}")
+
+                if "pe_ratio" in hist_df.columns and "earnings_growth_yoy" in hist_df.columns:
+                    pe = hist_df["pe_ratio"]
+                    eg = hist_df["earnings_growth_yoy"]
+                    eg_pct = eg * 100
+                    valid = pe.notna() & eg_pct.notna() & (eg_pct.abs() > 1.0) & (pe > 0)
+                    hist_df.loc[valid, "peg_ratio"] = pe[valid] / eg_pct[valid]
+
+                # Drop intermediate columns
+                for col in _INTERMEDIATE_COLS:
+                    if col in hist_df.columns:
+                        hist_df.drop(columns=[col], inplace=True)
 
                 # Build per-date snapshots keyed by "YYYY-MM-DD"
                 for date_idx, row in hist_df.iterrows():
@@ -188,6 +269,7 @@ class BacktestEngine:
                 self._log(
                     f"[backtest] Historical macro data loaded: {len(snapshots)} daily snapshots "
                     f"({hist_df.index.min().strftime('%Y-%m-%d')} to {hist_df.index.max().strftime('%Y-%m-%d')})"
+                    f" (with derived features)"
                 )
             else:
                 self._log("[backtest] Historical macro data returned empty, falling back to current snapshot")
@@ -335,7 +417,7 @@ class BacktestEngine:
         # Compute avg_win / avg_loss
         wins = [t["raw_return"] for t in ticker_trades if t["raw_return"] > 0]
         losses = [abs(t["raw_return"]) for t in ticker_trades if t["raw_return"] < 0]
-        avg_win = sum(wins) / len(wins) if wins else 0.03
+        avg_win = sum(wins) / len(wins) if wins else 0.09
         avg_loss = sum(losses) / len(losses) if losses else 0.02
 
         # Track record factor (same logic as real MemoryAgent)

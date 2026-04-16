@@ -16,6 +16,7 @@ import json
 import math
 import os
 import pickle
+from utils.calibrator import TemperatureScalingCalibrator  # noqa: F401 — needed for pickle
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -128,27 +129,27 @@ class ForecastAgent:
             self.lgb_meta = None
 
     def _load_calibrator(self) -> None:
-        """Load Isotonic Regression calibrator if available."""
-        # Prefer path from metadata, fallback to env/default
-        calibrator_path = None
-        if self.lgb_meta:
-            calibrator_path = self.lgb_meta.get("calibrator_path")
-        if not calibrator_path:
-            calibrator_path = os.getenv("FORECAST_CALIBRATOR_PATH", "data/forecast_calibrator.pkl")
-
-        if not os.path.exists(calibrator_path):
-            if self.verbose:
-                print(f"[forecast] Calibrator not found at {calibrator_path}")
-            return
-
+        """Load calibrator (Platt Scaling or Isotonic Regression) if available."""
         try:
+            calibrator_path = None
+            if self.lgb_meta:
+                calibrator_path = self.lgb_meta.get("calibrator_path")
+            if not calibrator_path:
+                calibrator_path = os.getenv("FORECAST_CALIBRATOR_PATH", "data/forecast_calibrator.pkl")
+
+            if not os.path.exists(calibrator_path):
+                if self.verbose:
+                    print(f"[forecast] Calibrator not found at {calibrator_path}")
+                return
+
             with open(calibrator_path, "rb") as f:
                 self.calibrator = pickle.load(f)
+
+            cal_type = type(self.calibrator).__name__
             if self.verbose:
-                print(f"[forecast] Isotonic calibrator loaded from {calibrator_path}")
+                print(f"[forecast] {cal_type} calibrator loaded from {calibrator_path}")
         except Exception as exc:
-            if self.verbose:
-                print(f"[forecast] Failed to load calibrator: {exc}")
+            print(f"[forecast] Failed to load calibrator: {exc}")
             self.calibrator = None
 
     def _sigmoid(self, value: float) -> float:
@@ -210,13 +211,16 @@ class ForecastAgent:
         """Extract macro/fundamental features for LightGBM inference.
 
         Converts the provider output into a flat dict matching the training
-        pipeline's column names.
+        pipeline's column names. Missing values are np.nan (LightGBM handles
+        NaN natively) instead of 0.0 to avoid incorrect splits.
         """
         row: Dict[str, float] = {}
         for col in MACRO_FEATURE_COLUMNS:
-            row[col] = self._coerce_float(macro_features.get(col))
+            val = macro_features.get(col)
+            row[col] = float(val) if val is not None else np.nan
         for col in FUNDAMENTAL_FEATURE_COLUMNS:
-            row[col] = self._coerce_float(fundamental_features.get(col))
+            val = fundamental_features.get(col)
+            row[col] = float(val) if val is not None else np.nan
         return row
 
     # ── LightGBM scoring (Phase 1 + 2 + macro/fundamental) ───────────────
@@ -288,7 +292,7 @@ class ForecastAgent:
         X = pd.DataFrame([row])[all_cols]
         raw_probability_up = float(self.lgb_model.predict(X)[0])
 
-        # Apply Isotonic calibration if available
+        # Apply calibration if available (Platt Scaling or Isotonic)
         calibrated = False
         if self.calibrator is not None:
             try:
@@ -299,15 +303,8 @@ class ForecastAgent:
         else:
             probability_up = raw_probability_up
 
-        # Soft-clamp: prevent Isotonic calibrator from over-polarizing
-        # The calibrator maps to [0.01, 0.99] which destroys ranking within
-        # 20-day windows (constant output → IC=NaN). Blend calibrated output
-        # with raw probability to preserve ordering while still benefiting
-        # from calibration.
+        # Hard floor/ceiling to avoid degenerate 0/1
         if calibrated:
-            _BLEND_ALPHA = 0.7  # 70% calibrated, 30% raw
-            probability_up = _BLEND_ALPHA * probability_up + (1 - _BLEND_ALPHA) * raw_probability_up
-            # Hard floor/ceiling to avoid degenerate 0/1
             probability_up = max(0.02, min(0.98, probability_up))
 
         # Store for uncertainty quantification

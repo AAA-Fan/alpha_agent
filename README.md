@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/FinanciAlAgent-Quantitative_Multi--Agent_System-blue?style=for-the-badge&logo=python&logoColor=white" alt="FinanciAlAgent"/>
+  <img src="https://img.shields.io/badge/AlphaAgent-Quantitative_Multi--Agent_System-blue?style=for-the-badge&logo=python&logoColor=white" alt="AlphaAgent"/>
 </p>
 
 <div align="center">
@@ -17,13 +17,13 @@
 
 ---
 
-## Why FinanciAlAgent?
+## Why AlphaAgent?
 
-Most LLM-based trading frameworks treat the market as a **text comprehension problem** — feeding news and financials into language models and hoping for good decisions. FinanciAlAgent takes a fundamentally different approach:
+Most LLM-based trading frameworks treat the market as a **text comprehension problem** — feeding news and financials into language models and hoping for good decisions. AlphaAgent takes a fundamentally different approach:
 
 > **LLMs handle what they're good at (reasoning, synthesis, review). ML models handle what they're good at (pattern recognition, probability estimation). Neither substitutes for the other.**
 
-| Capability | Typical LLM Trading Framework | FinanciAlAgent |
+| Capability | Typical LLM Trading Framework | AlphaAgent |
 |:---|:---|:---|
 | Forecast Method | LLM text reasoning | **LightGBM probabilistic model** with Isotonic calibration |
 | Uncertainty Quantification | ❌ None | ✅ **Conformal prediction sets** + tree dispersion |
@@ -39,10 +39,10 @@ Most LLM-based trading frameworks treat the market as a **text comprehension pro
 ## Architecture
 
 <p align="center">
-  <img src="assets/schema.png" width="800" alt="FinanciAlAgent Architecture"/>
+  <img src="assets/schema.png" width="800" alt="AlphaAgent Architecture"/>
 </p>
 
-FinanciAlAgent decomposes financial analysis into **15 specialized agents** organized in a **layered dependency graph** with parallel execution:
+AlphaAgent decomposes financial analysis into **15 specialized agents** organized in a **layered dependency graph** with parallel execution:
 
 ```
                           ┌─────────────────────────────────────────────┐
@@ -110,7 +110,7 @@ FinanciAlAgent decomposes financial analysis into **15 specialized agents** orga
   <img src="assets/quantitative_pipeline.png" width="800" alt="Quantitative Pipeline"/>
 </p>
 
-This is where FinanciAlAgent diverges from text-only frameworks. The quant pipeline is a **4-stage chain** where each stage adds measurable alpha, validated through ablation testing:
+This is where AlphaAgent diverges from text-only frameworks. The quant pipeline is a **4-stage chain** where each stage adds measurable alpha, validated through ablation testing:
 
 ### Stage 1: Feature Engineering Agent
 
@@ -218,7 +218,7 @@ While the quant pipeline handles numbers, LLM agents handle **context, reasoning
 
 ## 📊 Backtest Engine
 
-FinanciAlAgent includes a production-grade **Agent-in-the-Loop walk-forward backtest engine**:
+AlphaAgent includes a production-grade **Agent-in-the-Loop walk-forward backtest engine**:
 
 ```bash
 python scripts/run_backtest.py --ticker AAPL --start 2023-01-01 --end 2025-12-31
@@ -263,11 +263,11 @@ python scripts/debug_stage3_regime.py \
 
 ```bash
 git clone <your-repo-url>
-cd financialagent
+cd alphaagent
 
 # Create environment
-conda create -n financialagent python=3.10
-conda activate financialagent
+conda create -n alphaagent python=3.10
+conda activate alphaagent
 
 # Install dependencies
 pip install -r requirements.txt
@@ -389,7 +389,7 @@ print(f"Stop-loss: {risk['risk_plan']['stop_loss_pct']:.3f}")
 ## 📁 Project Structure
 
 ```
-financialagent/
+alphaagent/
 ├── agents/                          # 15 specialized agents
 │   ├── feature_engineering_agent.py # ML feature computation
 │   ├── regime_agent.py              # 3D market regime classifier

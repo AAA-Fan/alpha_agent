@@ -26,7 +26,7 @@ import pickle
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from sklearn.isotonic import IsotonicRegression
+from sklearn.isotonic import IsotonicRegression  # kept for backward compat with old .pkl files
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
@@ -114,19 +114,20 @@ LGB_PARAMS = {
     "objective": "binary",
     "metric": "auc",
     "boosting_type": "gbdt",
-    "num_leaves": 8,               # Very simple trees for small dataset
-    "max_depth": 3,                # Shallow trees to prevent overfitting
-    "learning_rate": 0.02,         # Small LR for gradual learning
-    "n_estimators": 300,           # Max rounds
-    "min_child_samples": 50,       # High threshold for statistical significance
-    "min_data_in_leaf": 50,        # Same as min_child_samples
-    "subsample": 0.7,              # Row subsampling
+    "num_leaves": 16,              # Moderate complexity for ~1200 samples
+    "max_depth": 4,                # Slightly deeper to capture interactions
+    "learning_rate": 0.01,         # Slow LR + more rounds = better generalisation
+    "n_estimators": 800,           # More rounds; early stopping will cut
+    "min_child_samples": 25,       # Lower threshold to allow finer splits
+    "min_data_in_leaf": 25,        # Same as min_child_samples
+    "subsample": 0.75,             # Slightly more data per tree
     "subsample_freq": 1,           # Apply subsampling every iteration
-    "colsample_bytree": 0.6,       # Aggressive column subsampling to reduce noise
-    "reg_alpha": 0.5,              # Moderate L1
-    "reg_lambda": 2.0,             # Strong L2
-    "min_gain_to_split": 0.005,    # Require meaningful splits
-    "path_smooth": 10.0,           # Smoothing for small leaf counts
+    "colsample_bytree": 0.7,       # Use more features per tree
+    "reg_alpha": 0.1,              # Lighter L1 to let model learn
+    "reg_lambda": 1.0,             # Moderate L2
+    "min_gain_to_split": 0.001,    # Lower bar for splits
+    "path_smooth": 5.0,            # Less aggressive smoothing
+    "extra_trees": True,           # Randomised splits for better generalisation
     "random_state": 42,
     "verbose": -1,
     "feature_pre_filter": False,
@@ -1164,15 +1165,21 @@ def train_lgb_model(
 # 8. Probability Calibration & Uncertainty Quantification
 # ═══════════════════════════════════════════════════════════════════════════
 
+from utils.calibrator import TemperatureScalingCalibrator  # noqa: E402
+
+
 def fit_isotonic_calibrator(
     oof_predictions: np.ndarray,
     y: np.ndarray,
-) -> Optional[IsotonicRegression]:
-    """Fit an Isotonic Regression calibrator from out-of-fold predictions.
+) -> Optional["TemperatureScalingCalibrator"]:
+    """Fit a Temperature Scaling calibrator from out-of-fold predictions.
 
-    Isotonic Regression learns a monotonically increasing mapping from raw
-    model probabilities to calibrated probabilities, so that a calibrated
-    output of 0.7 means ~70% of such predictions are truly positive.
+    Temperature Scaling is preferred over Isotonic Regression and Platt Scaling
+    because:
+    - It preserves the ranking of raw probabilities (IC unchanged)
+    - It has only 1 parameter → minimal overfitting risk
+    - It extrapolates gracefully when OOS raw probabilities exceed the
+      training range — a common occurrence in financial time-series
 
     Only valid (non-NaN) OOF predictions are used.
     """
@@ -1182,16 +1189,24 @@ def fit_isotonic_calibrator(
         print(f"  [warn] Only {n_valid} valid OOF predictions, skipping calibration")
         return None
 
-    calibrator = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
-    calibrator.fit(oof_predictions[valid_mask], y[valid_mask])
+    raw = oof_predictions[valid_mask]
+    labels = y[valid_mask]
+
+    calibrator = TemperatureScalingCalibrator()
+    calibrator.fit(raw, labels)
 
     # Report calibration effect
-    raw = oof_predictions[valid_mask]
     calibrated = calibrator.predict(raw)
-    print(f"  Isotonic calibration fitted on {n_valid} OOF samples")
+    print(f"  Temperature Scaling calibration fitted on {n_valid} OOF samples")
+    print(f"    Temperature T = {calibrator.temperature:.4f}  ({'softening' if calibrator.temperature > 1 else 'sharpening'})")
     print(f"    Raw prob range:        [{raw.min():.4f}, {raw.max():.4f}]")
     print(f"    Calibrated prob range:  [{calibrated.min():.4f}, {calibrated.max():.4f}]")
     print(f"    Raw mean:      {raw.mean():.4f}  →  Calibrated mean: {calibrated.mean():.4f}")
+
+    # Report extrapolation behavior at extreme values
+    test_extremes = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+    extreme_cal = calibrator.predict(test_extremes)
+    print(f"    Extrapolation check: {dict(zip(test_extremes.round(1), extreme_cal.round(4)))}")
 
     return calibrator
 
@@ -1282,6 +1297,14 @@ def main() -> None:
     half_life = int(os.getenv("TRAIN_SAMPLE_WEIGHT_HALFLIFE", "252"))
     enable_regime = os.getenv("TRAIN_ENABLE_REGIME", "true").lower() in ("true", "1", "yes")
     enable_macro_fund = os.getenv("TRAIN_ENABLE_MACRO_FUND", "true").lower() in ("true", "1", "yes")
+    train_end_date_str = os.getenv("TRAIN_END_DATE", "")
+    train_end_date: Optional[pd.Timestamp] = None
+    if train_end_date_str:
+        try:
+            train_end_date = pd.Timestamp(train_end_date_str)
+            print(f"  [config] TRAIN_END_DATE={train_end_date.date()}")
+        except Exception:
+            print(f"  [warn] Invalid TRAIN_END_DATE='{train_end_date_str}', ignoring")
 
     if is_v2:
         model_path = os.getenv("FORECAST_LGB_MODEL_PATH", "data/forecast_model_v2.lgb")
@@ -1304,6 +1327,7 @@ def main() -> None:
     print(f"  Half-life:      {half_life} days")
     print(f"  Regime features: {'ON' if enable_regime else 'OFF'}")
     print(f"  Macro/Fund features: {'ON' if enable_macro_fund else 'OFF'}")
+    print(f"  Train end date: {train_end_date.date() if train_end_date else 'now (latest)'}")
     print()
 
     # ── Step 1: Download data ────────────────────────────────────────────
@@ -1341,8 +1365,11 @@ def main() -> None:
 
     for ticker, data in raw_data.items():
         # Filter to lookback window
-        cutoff = pd.Timestamp.now() - pd.DateOffset(years=lookback_years)
+        anchor = train_end_date if train_end_date else pd.Timestamp.now()
+        cutoff = anchor - pd.DateOffset(years=lookback_years)
         data = data[data.index >= cutoff]
+        if train_end_date:
+            data = data[data.index <= train_end_date]
 
         if len(data) < 60:
             print(f"  [skip] {ticker}: only {len(data)} rows (need >= 60)")
@@ -1831,7 +1858,7 @@ def main() -> None:
         lgb_params=LGB_PARAMS_V2 if is_v2 else LGB_PARAMS,
     )
 
-    # ── Step 6.5: Isotonic calibration + Conformal scores ────────────────
+    # ── Step 6.5: Platt Scaling calibration + Conformal scores ─────────────
     print(f"\n[Step 6.5] Probability calibration & uncertainty quantification ...")
     calibrator_path = Path(calibrator_path_str)
 
