@@ -1,0 +1,101 @@
+{
+  "strong_rally": {
+    "strong_rally": 0.820574,
+    "trending_up": 0.035814,
+    "topping_out": 0.101047,
+    "range_bound": 0.006277,
+    "coiling": 0.002013,
+    "choppy": 0.001019,
+    "trending_down": 0.014946,
+    "bottoming_out": 0.015349,
+    "capitulation": 0.002961
+  },
+  "trending_up": {
+    "strong_rally": 0.172665,
+    "trending_up": 0.550129,
+    "topping_out": 0.131534,
+    "range_bound": 0.014996,
+    "coiling": 0.00557,
+    "choppy": 0.004713,
+    "trending_down": 0.073693,
+    "bottoming_out": 0.017995,
+    "capitulation": 0.028706
+  },
+  "topping_out": {
+    "strong_rally": 0.252189,
+    "trending_up": 0.07707,
+    "topping_out": 0.479497,
+    "range_bound": 0.024534,
+    "coiling": 0.007802,
+    "choppy": 0.005115,
+    "trending_down": 0.03433,
+    "bottoming_out": 0.101951,
+    "capitulation": 0.017512
+  },
+  "range_bound": {
+    "strong_rally": 0.333557,
+    "trending_up": 0.057602,
+    "topping_out": 0.080375,
+    "range_bound": 0.09645,
+    "coiling": 0.004019,
+    "choppy": 0.0,
+    "trending_down": 0.214334,
+    "bottoming_out": 0.210985,
+    "capitulation": 0.002679
+  },
+  "coiling": {
+    "strong_rally": 0.249516,
+    "trending_up": 0.054159,
+    "topping_out": 0.056093,
+    "range_bound": 0.001934,
+    "coiling": 0.145068,
+    "choppy": 0.0,
+    "trending_down": 0.245648,
+    "bottoming_out": 0.247582,
+    "capitulation": 0.0
+  },
+  "choppy": {
+    "strong_rally": 0.254296,
+    "trending_up": 0.116838,
+    "topping_out": 0.109966,
+    "range_bound": 0.0,
+    "coiling": 0.0,
+    "choppy": 0.065292,
+    "trending_down": 0.09622,
+    "bottoming_out": 0.168385,
+    "capitulation": 0.189003
+  },
+  "trending_down": {
+    "strong_rally": 0.041683,
+    "trending_up": 0.011169,
+    "topping_out": 0.004593,
+    "range_bound": 0.011134,
+    "coiling": 0.003897,
+    "choppy": 0.001113,
+    "trending_down": 0.732821,
+    "bottoming_out": 0.176507,
+    "capitulation": 0.017084
+  },
+  "bottoming_out": {
+    "strong_rally": 0.077867,
+    "trending_up": 0.009687,
+    "topping_out": 0.02127,
+    "range_bound": 0.01948,
+    "coiling": 0.005739,
+    "choppy": 0.004107,
+    "trending_down": 0.27356,
+    "bottoming_out": 0.545225,
+    "capitulation": 0.043066
+  },
+  "capitulation": {
+    "strong_rally": 0.010701,
+    "trending_up": 0.012994,
+    "topping_out": 0.012102,
+    "range_bound": 0.000637,
+    "coiling": 0.0,
+    "choppy": 0.003439,
+    "trending_down": 0.058344,
+    "bottoming_out": 0.142293,
+    "capitulation": 0.75949
+  }
+}

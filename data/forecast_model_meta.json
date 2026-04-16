@@ -1,0 +1,198 @@
+{
+  "version": 4,
+  "model_type": "lightgbm",
+  "model_path": "data/forecast_model.lgb",
+  "label_type": "excess_return",
+  "benchmark": "SPY",
+  "calibrator_path": "data/forecast_calibrator.pkl",
+  "calibrated": true,
+  "conformal_scores_quantiles": {
+    "q80": 0.5075238588989779,
+    "q85": 0.5084015960391953,
+    "q90": 0.5106837773572636,
+    "q95": 0.5118735256217571
+  },
+  "conformal_n_samples": 1200,
+  "conformal_score_mean": 0.49986439533086413,
+  "conformal_score_std": 0.008234471698505065,
+  "trained_at": "2026-04-16T07:33:25Z",
+  "trainer": "pipelines/train_forecast_model.py",
+  "target_horizon_days": 5,
+  "tickers": [
+    "AAPL"
+  ],
+  "feature_columns": [
+    "momentum_5",
+    "momentum_20",
+    "sma_20_ratio",
+    "sma_50_ratio",
+    "macd_hist",
+    "rsi_14",
+    "volatility_20",
+    "daily_volatility_20",
+    "atr_14",
+    "volume_zscore_20",
+    "drawdown_60",
+    "overnight_gap",
+    "intraday_return",
+    "return_1d",
+    "return_5d",
+    "momentum_trend_align",
+    "rsi_deviation",
+    "vol_confirmed_momentum",
+    "mean_reversion",
+    "vol_adj_momentum_5"
+  ],
+  "regime_features": [
+    "regime_direction",
+    "regime_volatility_ord",
+    "trend_strength",
+    "vol_expanding",
+    "momentum_health_enc"
+  ],
+  "macro_fundamental_features": [
+    "fed_funds_rate",
+    "rate_change_3m",
+    "treasury_yield_10y",
+    "treasury_yield_2y",
+    "yield_spread_10y2y",
+    "cpi_yoy",
+    "unemployment_rate",
+    "vix_level",
+    "vix_percentile_1y",
+    "spy_momentum_20d",
+    "pe_ratio",
+    "peg_ratio",
+    "pb_ratio",
+    "ps_ratio",
+    "ev_ebitda",
+    "roe",
+    "profit_margin",
+    "revenue_growth_yoy",
+    "earnings_growth_yoy",
+    "current_ratio",
+    "debt_to_equity",
+    "beta",
+    "financial_health_score"
+  ],
+  "cv_metrics": {
+    "mean_auc": 0.5843,
+    "std_auc": 0.0691,
+    "mean_accuracy": 0.5067,
+    "mean_log_loss": 0.6939,
+    "fold_details": [
+      {
+        "fold": 1,
+        "auc": 0.5025,
+        "accuracy": 0.55,
+        "log_loss": 0.6909,
+        "best_iteration": 20,
+        "train_size": 1065,
+        "val_size": 120
+      },
+      {
+        "fold": 2,
+        "auc": 0.5053,
+        "accuracy": 0.425,
+        "log_loss": 0.702,
+        "best_iteration": 11,
+        "train_size": 1050,
+        "val_size": 120
+      },
+      {
+        "fold": 3,
+        "auc": 0.6004,
+        "accuracy": 0.5167,
+        "log_loss": 0.6892,
+        "best_iteration": 76,
+        "train_size": 1050,
+        "val_size": 120
+      },
+      {
+        "fold": 4,
+        "auc": 0.5008,
+        "accuracy": 0.4667,
+        "log_loss": 0.6974,
+        "best_iteration": 2,
+        "train_size": 1050,
+        "val_size": 120
+      },
+      {
+        "fold": 5,
+        "auc": 0.6206,
+        "accuracy": 0.5917,
+        "log_loss": 0.6815,
+        "best_iteration": 57,
+        "train_size": 1050,
+        "val_size": 120
+      },
+      {
+        "fold": 6,
+        "auc": 0.6284,
+        "accuracy": 0.45,
+        "log_loss": 0.6996,
+        "best_iteration": 7,
+        "train_size": 1050,
+        "val_size": 120
+      },
+      {
+        "fold": 7,
+        "auc": 0.5589,
+        "accuracy": 0.6167,
+        "log_loss": 0.6893,
+        "best_iteration": 4,
+        "train_size": 1050,
+        "val_size": 120
+      },
+      {
+        "fold": 8,
+        "auc": 0.5567,
+        "accuracy": 0.475,
+        "log_loss": 0.6991,
+        "best_iteration": 33,
+        "train_size": 1050,
+        "val_size": 120
+      },
+      {
+        "fold": 9,
+        "auc": 0.7215,
+        "accuracy": 0.4833,
+        "log_loss": 0.6983,
+        "best_iteration": 1,
+        "train_size": 1050,
+        "val_size": 120
+      },
+      {
+        "fold": 10,
+        "auc": 0.6481,
+        "accuracy": 0.4917,
+        "log_loss": 0.692,
+        "best_iteration": 7,
+        "train_size": 1065,
+        "val_size": 120
+      }
+    ]
+  },
+  "training_info": {
+    "tickers": [
+      "AAPL"
+    ],
+    "tickers_count": 1,
+    "total_samples": 1200,
+    "date_range": [
+      "2020-03-26",
+      "2024-12-31"
+    ],
+    "class_balance": {
+      "positive": 0.5075,
+      "negative": 0.4925
+    },
+    "best_iteration": 21,
+    "sample_weight_half_life": 252,
+    "data_source": "alpha_vantage_premium",
+    "regime_features_enabled": true,
+    "regime_smoothing_enabled": true,
+    "macro_fundamental_features_enabled": true,
+    "macro_fundamental_features_count": 23
+  }
+}

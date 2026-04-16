@@ -1,0 +1,11 @@
+{
+  "strong_rally":   {"max_position": 1.0, "stop_multiplier": 1.2, "confidence_floor": 0.3},
+  "trending_up":    {"max_position": 0.8, "stop_multiplier": 1.0, "confidence_floor": 0.3},
+  "bottoming_out":  {"max_position": 0.3, "stop_multiplier": 0.7, "confidence_floor": 0.5},
+  "range_bound":    {"max_position": 0.4, "stop_multiplier": 0.8, "confidence_floor": 0.4},
+  "coiling":        {"max_position": 0.5, "stop_multiplier": 0.9, "confidence_floor": 0.4},
+  "choppy":         {"max_position": 0.2, "stop_multiplier": 0.6, "confidence_floor": 0.6},
+  "topping_out":    {"max_position": 0.3, "stop_multiplier": 0.7, "confidence_floor": 0.5},
+  "trending_down":  {"max_position": 0.5, "stop_multiplier": 0.8, "confidence_floor": 0.4},
+  "capitulation":   {"max_position": 0.1, "stop_multiplier": 0.5, "confidence_floor": 0.7}
+}
