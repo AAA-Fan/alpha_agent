@@ -232,14 +232,15 @@ def score_features_with_regime(
     except Exception:
         pass
 
-    # Method 2: Conformal prediction set (uses raw_prob)
+    # Method 2: Conformal prediction set (uses calibrated prob to match
+    # training-time conformal scores which are computed on calibrated probs)
     quantiles = meta.get("conformal_scores_quantiles", {})
     threshold = quantiles.get("q90")
     if threshold is not None:
         prediction_set = []
-        if (1.0 - raw_prob) <= threshold:
+        if (1.0 - prob) <= threshold:
             prediction_set.append("up")
-        if raw_prob <= threshold:
+        if prob <= threshold:
             prediction_set.append("down")
         uncertainty_info["prediction_set"] = prediction_set
         if len(prediction_set) == 2:

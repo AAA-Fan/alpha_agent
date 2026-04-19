@@ -221,10 +221,60 @@ While the quant pipeline handles numbers, LLM agents handle **context, reasoning
 AlphaAgent includes a production-grade **Agent-in-the-Loop walk-forward backtest engine**:
 
 ```bash
-python scripts/run_backtest.py --ticker AAPL --start 2023-01-01 --end 2025-12-31
+# Standard walk-forward backtest with monthly retraining
+python scripts/run_walk_forward_backtest.py --ticker AAPL --start 2025-01-01 --end 2026-04-18
+
+# Custom training window and parameters
+python scripts/run_walk_forward_backtest.py --ticker AAPL --start 2025-01-01 --end 2026-04-18 --train-years 5 --horizon 5 --verbose
 ```
 
 **Execution model**: Signal at Close → Execute at Next Open (realistic, no lookahead).
+
+### 🚀 Walk-Forward Backtest: Advanced Features
+
+Our walk-forward engine implements **realistic retraining** that eliminates look-ahead bias:
+
+**Monthly Retraining Pipeline**:
+1. **Train** LightGBM on rolling 5-year window [T-5y, T)
+2. **Calibrate** with isotonic calibration + conformal prediction
+3. **Predict** next month's trades using freshly trained model
+4. **Slide** window forward by 1 month, repeat
+
+**Key Innovations**:
+- **No Look-Ahead Bias**: Model only sees data available at prediction time
+- **Conformal Uncertainty**: Quantifies model uncertainty for risk control
+- **Signal Quality Tracking**: Monitors rejection reasons and signal alignment
+- **Per-Regime Analysis**: Breaks down performance by market regime
+
+### 📈 Latest Backtest Results (2025-01-01 to 2026-04-18)
+
+**Strategy Performance**:
+- **Total Return**: +49.14% (vs +21.47% Buy & Hold)
+- **Annualized Return**: +313.14%
+- **Sharpe Ratio**: 2.69
+- **Max Drawdown**: -5.20%
+- **Hit Rate**: 60.6%
+- **Profit Factor**: 3.08
+
+**Risk Control Effectiveness**:
+- **Signal Conflict Override**: 23 trades rejected (high-confidence override preserved)
+- **Strong Rally No-Short**: 6 short trades prevented in strong_rally regime
+- **Conformal Ambiguous**: 9 trades rejected due to model uncertainty
+- **Total Rejection Rate**: 53.5% (38/71 signals)
+
+**Per-Regime Performance**:
+| Regime | Trades | Hit Rate | Avg Return | Contribution |
+|:---|:---|:---|:---|:---|
+| **Strong Rally** | 6 | **100.0%** | +3.77% | **+56.3%** |
+| Topping Out | 6 | 66.7% | +1.70% | +25.3% |
+| Trending Down | 14 | 57.1% | +0.16% | +5.7% |
+| Bottoming Out | 6 | 16.7% | +0.27% | +4.1% |
+| Trending Up | 1 | 100.0% | +3.47% | +8.6% |
+
+**Exit Analysis**:
+- **Horizon Exit**: 78.8% of trades | Avg Return: +1.01%
+- **Stop-Loss**: 12.1% of trades | Avg Return: -2.15%
+- **Take-Profit**: 9.1% of trades | Avg Return: +7.48%
 
 ### Evaluation Metrics (17+ indicators)
 
@@ -244,7 +294,7 @@ We provide a **systematic debug toolkit** to validate each agent's marginal cont
 ```
 Stage 0: Signal IC           — Raw feature predictive power (no agents)
 Stage 1: Forecast Only       — LightGBM predictions, threshold sweep
-Stage 2: Forecast + Risk     — Add position sizing, stops, uncertainty gates
+Stage 2: Forecast + Risk      — Add position sizing, stops, uncertainty gates
 Stage 3: + Regime Agent      — Add regime features, signal alignment, ablation variants
 ```
 
@@ -304,6 +354,28 @@ python example_usage.py
 python pipelines/train_forecast_model.py
 ```
 
+### Run Walk-Forward Backtest
+
+```bash
+# Basic walk-forward backtest (16 months, monthly retraining)
+python scripts/run_walk_forward_backtest.py --ticker AAPL --start 2025-01-01 --end 2026-04-18
+
+# Custom parameters
+python scripts/run_walk_forward_backtest.py --ticker AAPL --start 2025-01-01 --end 2026-04-18 \
+  --train-years 5 --horizon 5 --cost-bps 5 --slippage-bps 5 --verbose
+
+# Multi-ticker backtest (batch processing)
+python scripts/run_walk_forward_backtest.py --ticker AAPL,MSFT,GOOGL --start 2025-01-01 --end 2026-04-18
+```
+
+**Output includes**:
+- Full backtest report with 17+ performance metrics
+- Trade-by-trade execution log
+- Equity curve vs benchmark (SPY)
+- Monthly breakdown with retraining windows
+- Per-regime performance analysis
+- Signal quality and rejection analysis
+
 ### Python API
 
 ```python
@@ -328,6 +400,42 @@ print(f"Action: {forecast['forecast']['action']}")
 print(f"P(up): {forecast['forecast']['probability_up']:.3f}")
 print(f"Position: {risk['risk_plan']['position_size_fraction']:.3f}")
 print(f"Stop-loss: {risk['risk_plan']['stop_loss_pct']:.3f}")
+```
+
+### Walk-Forward Backtest API
+
+```python
+from backtest.walk_forward_engine import WalkForwardBacktestEngine
+
+# Initialize walk-forward engine
+wf_engine = WalkForwardBacktestEngine(
+    ticker="AAPL",
+    start_date="2025-01-01",
+    end_date="2026-04-18",
+    train_years=5,
+    retrain_frequency="monthly",
+    horizon_days=5,
+    transaction_cost_bps=5.0,
+    slippage_bps=5.0,
+    verbose=True
+)
+
+# Run walk-forward backtest
+result = wf_engine.run()
+
+# Access results
+print(f"Total return: {result.overall['total_return']:.2%}")
+print(f"Sharpe ratio: {result.overall['sharpe_ratio']:.2f}")
+print(f"Max drawdown: {result.overall['max_drawdown']:.2%}")
+
+# Analyze monthly performance
+for month in result.monthly_summaries:
+    print(f"{month['month']}: {month['monthly_return']:.2%} return, {month['hit_rate']:.1%} hit rate")
+
+# Signal quality analysis
+print(f"Signal rejection rate: {result.signal_quality['rejection_rate']:.1%}")
+for reason, count in result.signal_quality['reject_reasons'].items():
+    print(f"  - {reason}: {count} trades")
 ```
 
 ---

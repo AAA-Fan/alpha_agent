@@ -238,7 +238,7 @@ def compute_features(data: pd.DataFrame) -> dict:
 
     def _safe(val):
         if val is None or (isinstance(val, float) and (np.isnan(val) or np.isinf(val))):
-            return 0.0
+            return np.nan  # Let LightGBM handle missing values natively
         return float(val)
 
     f = {
@@ -327,6 +327,21 @@ def run_signal_ic_analysis(
     start_idx = dates.searchsorted(pd.Timestamp(start_date))
     start_idx = max(start_idx, 60)  # Need at least 60 bars for features
     horizon = meta.get("target_horizon_days", 5)
+
+    # ── Load SPY data for excess-return calculation (matching training label) ──
+    spy_close = None
+    try:
+        spy_cache_file = Path("data/training_cache/SPY_daily.csv")
+        if spy_cache_file.exists():
+            spy_df = pd.read_csv(spy_cache_file, index_col=0, parse_dates=True)
+        else:
+            spy_df = get_historical_data("SPY", interval="daily", outputsize="full")
+        if not spy_df.empty:
+            spy_close = pd.to_numeric(spy_df["Close"], errors="coerce")
+            spy_close = spy_close.reindex(dates, method="ffill")
+            print(f"  [SPY] Loaded benchmark data for excess-return calculation")
+    except Exception as exc:
+        print(f"  [warn] SPY data load failed: {exc}, falling back to absolute return")
 
     # ── Pre-fetch macro/fundamental historical data (once, not per step) ──
     macro_fund_df = None
@@ -488,34 +503,36 @@ def run_signal_ic_analysis(
         X = pd.DataFrame([row])[all_cols]
         raw_prob = float(model.predict(X)[0])
 
-        # Apply calibration
-        if calibrator is not None:
-            try:
-                prob = float(calibrator.predict([raw_prob])[0])
-            except Exception:
-                prob = raw_prob
-        else:
-            prob = raw_prob
+        # Use raw probability directly (skip calibrator to avoid over-smoothing)
+        prob = raw_prob
 
-        # Hard floor/ceiling to avoid degenerate 0/1
-        if calibrator is not None:
-            prob = max(0.02, min(0.98, prob))
-
-        # Actual 5-day forward return
+        # Actual 5-day forward return (excess over SPY, matching training label)
         future_close = close_prices.iloc[t + horizon]
-        current_close = close_prices.iloc[t]
-        actual_5d_return = (future_close / current_close) - 1.0
+        current_close_val = close_prices.iloc[t]
+        stock_5d_return = (future_close / current_close_val) - 1.0
+
+        # Compute SPY benchmark return for the same period
+        spy_5d_return = 0.0
+        if spy_close is not None:
+            spy_current = spy_close.iloc[t]
+            spy_future = spy_close.iloc[t + horizon]
+            if pd.notna(spy_current) and pd.notna(spy_future) and spy_current > 0:
+                spy_5d_return = (spy_future / spy_current) - 1.0
+
+        excess_5d_return = stock_5d_return - spy_5d_return
 
         records.append({
             "date": current_date.strftime("%Y-%m-%d"),
             "predicted_prob_up": prob,
             "raw_prob_up": raw_prob,
-            "actual_5d_return": float(actual_5d_return),
-            "actual_direction": 1 if actual_5d_return > 0 else 0,
+            "stock_5d_return": float(stock_5d_return),
+            "spy_5d_return": float(spy_5d_return),
+            "actual_5d_return": float(excess_5d_return),  # excess return
+            "actual_direction": 1 if excess_5d_return > 0 else 0,  # outperforms SPY
         })
 
         if verbose and step % 50 == 0:
-            print(f"  [{ticker}] Step {step}/{total_steps}: date={current_date.strftime('%Y-%m-%d')}, prob={prob:.4f}, actual_5d={actual_5d_return:+.4f}")
+            print(f"  [{ticker}] Step {step}/{total_steps}: date={current_date.strftime('%Y-%m-%d')}, prob={prob:.4f}, excess_5d={excess_5d_return:+.4f}")
 
     df = pd.DataFrame(records)
     print(f"  [{ticker}] Collected {len(df)} signal-return pairs")
@@ -546,9 +563,16 @@ def analyze_ic(df: pd.DataFrame, ticker: str) -> dict:
     ic_ir = mean_ic / std_ic if std_ic > 0 else 0.0
     ic_hit_rate = np.mean([1 if ic > 0 else 0 for ic in rolling_ics]) if rolling_ics else 0.0
 
-    # ── 2. Directional accuracy ──────────────────────────────────────────
+    # ── 2. Directional accuracy (excess return: outperform SPY) ─────────
     df["predicted_direction"] = (df["predicted_prob_up"] > 0.5).astype(int)
     directional_accuracy = (df["predicted_direction"] == df["actual_direction"]).mean()
+
+    # Also compute absolute-return accuracy for reference
+    if "stock_5d_return" in df.columns:
+        abs_direction = (df["stock_5d_return"] > 0).astype(int)
+        abs_accuracy = (df["predicted_direction"] == abs_direction).mean()
+    else:
+        abs_accuracy = directional_accuracy
 
     # ── 3. Quintile analysis ─────────────────────────────────────────────
     df["quintile"] = pd.qcut(df["predicted_prob_up"], q=5, labels=False, duplicates="drop")
@@ -577,9 +601,16 @@ def analyze_ic(df: pd.DataFrame, ticker: str) -> dict:
     raw_min = df["raw_prob_up"].min()
     raw_max = df["raw_prob_up"].max()
 
+    # ── 7. Excess return statistics ───────────────────────────────────────
+    avg_excess = df["actual_5d_return"].mean()
+    avg_stock = df["stock_5d_return"].mean() if "stock_5d_return" in df.columns else avg_excess
+    avg_spy = df["spy_5d_return"].mean() if "spy_5d_return" in df.columns else 0.0
+    pct_outperform = (df["actual_direction"] == 1).mean()
+
     results = {
         "ticker": ticker,
         "n_samples": len(df),
+        "label_type": "excess_return (stock - SPY)",
         "overall_ic": round(float(overall_ic), 6),
         "overall_ic_pval": round(float(overall_pval), 6),
         "mean_rolling_ic": round(float(mean_ic), 6),
@@ -587,7 +618,12 @@ def analyze_ic(df: pd.DataFrame, ticker: str) -> dict:
         "ic_ir": round(float(ic_ir), 4),
         "ic_hit_rate": round(float(ic_hit_rate), 4),
         "directional_accuracy": round(float(directional_accuracy), 4),
+        "abs_return_accuracy": round(float(abs_accuracy), 4),
         "long_short_spread_5d": round(float(long_short_spread), 6),
+        "avg_excess_return_5d": round(float(avg_excess), 6),
+        "avg_stock_return_5d": round(float(avg_stock), 6),
+        "avg_spy_return_5d": round(float(avg_spy), 6),
+        "pct_outperform_spy": round(float(pct_outperform), 4),
         "buy_signals": int(buy_signals),
         "sell_signals": int(sell_signals),
         "hold_signals": int(hold_signals),
@@ -607,6 +643,7 @@ def print_report(results: dict) -> None:
 
     print(f"\n{'='*60}")
     print(f"  Stage 0: Signal IC Report — {ticker}")
+    print(f"  Label: {results.get('label_type', 'excess_return')}")
     print(f"{'='*60}")
 
     print(f"\n📊 Sample Size: {results['n_samples']} signal-return pairs")
@@ -631,10 +668,19 @@ def print_report(results: dict) -> None:
     print(f"  IC Hit Rate:    {ic_hit:.2%}  {'✅ > 50%' if ic_hit > 0.5 else '❌ ≤ 50%'}")
     print(f"  Quality:        {ic_quality}")
 
-    # Directional accuracy
-    print(f"\n── Directional Accuracy ──")
+    # Directional accuracy (excess return)
+    print(f"\n── Directional Accuracy (Excess Return: Outperform SPY) ──")
     acc = results["directional_accuracy"]
-    print(f"  Accuracy:       {acc:.2%}  {'✅ > 52%' if acc > 0.52 else '❌ ≤ 52%'}")
+    abs_acc = results.get("abs_return_accuracy", acc)
+    print(f"  Excess Ret Acc: {acc:.2%}  {'✅ > 52%' if acc > 0.52 else '❌ ≤ 52%'}  (model trained on this)")
+    print(f"  Abs Return Acc: {abs_acc:.2%}  (reference only)")
+
+    # Excess return statistics
+    print(f"\n── Excess Return Statistics ──")
+    print(f"  Avg Excess Return (5d): {results.get('avg_excess_return_5d', 0):+.6f}")
+    print(f"  Avg Stock Return (5d):  {results.get('avg_stock_return_5d', 0):+.6f}")
+    print(f"  Avg SPY Return (5d):    {results.get('avg_spy_return_5d', 0):+.6f}")
+    print(f"  % Outperform SPY:       {results.get('pct_outperform_spy', 0):.2%}")
 
     # Long-short spread
     print(f"\n── Quintile Analysis (Long-Short) ──")
@@ -660,13 +706,13 @@ def print_report(results: dict) -> None:
     print(f"  Range: [{results['raw_prob_range'][0]:.6f}, {results['raw_prob_range'][1]:.6f}]")
 
     # Calibration
-    print(f"\n── Calibration (Predicted Prob vs Actual Win Rate) ──")
+    print(f"\n── Calibration (Predicted Prob vs Actual Outperform Rate) ──")
     for row in results.get("calibration", []):
         pred = row.get("mean_predicted", 0)
         actual = row.get("actual_win_rate", 0)
         count = row.get("count", 0)
         gap = actual - pred
-        print(f"    Predicted={pred:.3f} | Actual={actual:.3f} | Gap={gap:+.3f} | n={count}")
+        print(f"    Predicted={pred:.3f} | ActualOutperform={actual:.3f} | Gap={gap:+.3f} | n={count}")
 
     # Overall verdict
     print(f"\n{'─'*60}")
@@ -744,8 +790,8 @@ def main():
             pooled = pd.concat(all_dfs, ignore_index=True)
             pooled_ic, pooled_pval = stats.spearmanr(pooled["predicted_prob_up"], pooled["actual_5d_return"])
             pooled_acc = (pooled["predicted_prob_up"].gt(0.5).astype(int) == pooled["actual_direction"]).mean()
-            print(f"\n  Pooled IC:       {pooled_ic:+.6f} (p={pooled_pval:.4f})")
-            print(f"  Pooled Accuracy: {pooled_acc:.2%}")
+            print(f"\n  Pooled IC (excess return): {pooled_ic:+.6f} (p={pooled_pval:.4f})")
+            print(f"  Pooled Accuracy (excess):  {pooled_acc:.2%}")
 
     # Save results
     output_dir = Path("data/backtest_results")

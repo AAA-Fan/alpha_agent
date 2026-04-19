@@ -207,6 +207,7 @@ class RiskAgent:
         risk_flags: list[str] = []
         reject_reason: str | None = None
         kelly_fraction = 0.0  # Will be updated if Kelly calculation runs
+        position_size = 0.0  # Initialize position size
 
         # ── ① Signal alignment ──────────────────────────────────────────
         alignment = self._compute_signal_alignment(regime_state, probability_up)
@@ -222,6 +223,12 @@ class RiskAgent:
                 position_size = 0.0
                 reject_reason = "signal_conflict"
                 risk_flags.append("signal_conflict")
+
+        # ── Strong rally regime: prohibit short selling ──────────────────────
+        if reject_reason is None and regime_state == "strong_rally" and action == "sell":
+            position_size = 0.0
+            reject_reason = "strong_rally_no_short"
+            risk_flags.append("strong_rally_no_short")
 
         if reject_reason is None:
             # ── ② 1/4 Kelly position sizing ─────────────────────────────

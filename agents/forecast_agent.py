@@ -242,7 +242,7 @@ class ForecastAgent:
         # Build base feature vector
         row: Dict[str, float] = {}
         for col in feature_cols:
-            row[col] = self._coerce_float(features.get(col))
+            row[col] = self._coerce_float(features.get(col), default=np.nan)
 
         # Add regime features if Phase 2 model
         if regime_cols:
@@ -256,7 +256,7 @@ class ForecastAgent:
                 macro_features or {}, fundamental_features or {},
             )
             for col in macro_fund_cols:
-                row[col] = mf_vector.get(col, 0.0)
+                row[col] = mf_vector.get(col, np.nan)
 
         # V2: Add cross-sectional rank features
         if rank_cols and self.cross_section_service:
@@ -543,6 +543,8 @@ class ForecastAgent:
             pass  # Degrade gracefully
 
         # ── Method 2: Conformal prediction set ───────────────────────
+        # Use calibrated prob to match training-time conformal scores
+        # which are computed on calibrated probabilities.
         if self.lgb_meta:
             quantiles = self.lgb_meta.get("conformal_scores_quantiles", {})
             threshold = quantiles.get("q90")  # 90% coverage level
@@ -550,12 +552,11 @@ class ForecastAgent:
                 prediction_set = []
                 # Check if "up" is in the prediction set
                 # nonconformity score for "up" = 1 - prob_up
-                # Use raw_prob (not calibrated) to match raw-based quantiles
-                if (1.0 - raw_prob) <= threshold:
+                if (1.0 - calibrated_prob) <= threshold:
                     prediction_set.append("up")
                 # Check if "down" is in the prediction set
                 # nonconformity score for "down" = prob_up
-                if raw_prob <= threshold:
+                if calibrated_prob <= threshold:
                     prediction_set.append("down")
 
                 result["prediction_set"] = prediction_set

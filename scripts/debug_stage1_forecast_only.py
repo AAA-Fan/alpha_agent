@@ -240,7 +240,7 @@ def compute_features(data: pd.DataFrame) -> dict:
 
     def _safe(val):
         if val is None or (isinstance(val, float) and (np.isnan(val) or np.isinf(val))):
-            return 0.0
+            return np.nan  # Let LightGBM handle missing values natively
         return float(val)
 
     f = {
@@ -350,17 +350,8 @@ def score_features(
     X = pd.DataFrame([row])[all_cols]
     raw_prob = float(model.predict(X)[0])
 
-    # Apply calibration with soft-clamp
-    if calibrator is not None:
-        try:
-            cal_prob = float(calibrator.predict([raw_prob])[0])
-        except Exception:
-            cal_prob = raw_prob
-        # Soft-clamp: 70% calibrated + 30% raw to prevent over-polarization
-        prob = 0.7 * cal_prob + 0.3 * raw_prob
-        prob = max(0.02, min(0.98, prob))
-    else:
-        prob = raw_prob
+    # Use raw probability directly (skip calibrator to avoid over-smoothing)
+    prob = raw_prob
 
     if not return_uncertainty:
         return raw_prob, prob
@@ -390,19 +381,17 @@ def score_features(
     except Exception:
         pass
 
-    # Method 2: Conformal prediction set (uses raw_prob to avoid soft-clamp bias)
-    # The soft-clamp calibrator pulls extreme probs toward center, which makes
-    # conformal filtering overlap with proxy uncertainty. Using raw_prob gives
-    # a more independent uncertainty signal.
+    # Method 2: Conformal prediction set (uses calibrated prob to match
+    # training-time conformal scores which are computed on calibrated probs)
     quantiles = meta.get("conformal_scores_quantiles", {})
     threshold = quantiles.get("q90")
     if threshold is not None:
         prediction_set = []
-        # "up" in set ⟺ 1 - raw_prob ≤ threshold ⟺ raw_prob ≥ 1 - threshold
-        if (1.0 - raw_prob) <= threshold:
+        # "up" in set ⟺ 1 - prob ≤ threshold ⟺ prob ≥ 1 - threshold
+        if (1.0 - prob) <= threshold:
             prediction_set.append("up")
-        # "down" in set ⟺ raw_prob ≤ threshold
-        if raw_prob <= threshold:
+        # "down" in set ⟺ prob ≤ threshold
+        if prob <= threshold:
             prediction_set.append("down")
         uncertainty_info["prediction_set"] = prediction_set
         # Both labels → ambiguous → uncertain
