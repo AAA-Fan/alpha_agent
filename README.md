@@ -401,7 +401,6 @@ print(f"P(up): {forecast['forecast']['probability_up']:.3f}")
 print(f"Position: {risk['risk_plan']['position_size_fraction']:.3f}")
 print(f"Stop-loss: {risk['risk_plan']['stop_loss_pct']:.3f}")
 ```
-
 ### Walk-Forward Backtest API
 
 ```python

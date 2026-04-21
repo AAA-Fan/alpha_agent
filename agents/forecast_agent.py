@@ -450,6 +450,17 @@ class ForecastAgent:
             "raw_probability_up": float(self._last_raw_prob) if self._last_raw_prob is not None else float(probability_up),
             "calibrated": bool(self._last_calibrated),
             "action": action,
+            # Expose Layer-1 adaptive thresholds so downstream agents
+            # (e.g. RiskAgent probability-conviction Kelly scaling) can
+            # anchor "signal strength" on the same cutoff that Layer-1
+            # used to admit the trade. These are the per-month buy/sell
+            # thresholds when FORECAST_BUY_THRESHOLD / FORECAST_SELL_THRESHOLD
+            # are injected by the walk-forward driver; otherwise they
+            # fall back to the default 0.55 / 0.45.
+            "layer1_thresholds": {
+                "buy": float(self.buy_threshold),
+                "sell": float(self.sell_threshold),
+            },
             **uncertainty_info,
         }
         # Build summary with uncertainty info
@@ -548,17 +559,45 @@ class ForecastAgent:
         if self.lgb_meta:
             quantiles = self.lgb_meta.get("conformal_scores_quantiles", {})
             threshold = quantiles.get("q90")  # 90% coverage level
+
+            # Always compute the legacy q90-based set first (kept for diagnostics)
+            q90_set = None
             if threshold is not None:
-                prediction_set = []
+                q90_set = []
                 # Check if "up" is in the prediction set
                 # nonconformity score for "up" = 1 - prob_up
                 if (1.0 - calibrated_prob) <= threshold:
-                    prediction_set.append("up")
+                    q90_set.append("up")
                 # Check if "down" is in the prediction set
                 # nonconformity score for "down" = prob_up
                 if calibrated_prob <= threshold:
-                    prediction_set.append("down")
+                    q90_set.append("down")
 
+            # Adaptive conformal (Layer-1 aware):
+            # Replaces the training-time OOF q90 set with one derived from
+            # the per-month Layer-1 buy/sell thresholds that are already
+            # validated to hit precision>=55%. This stops high-vol tickers
+            # (e.g. NVDA) from rejecting most signals as "ambiguous".
+            # Controlled by env var FORECAST_ADAPTIVE_CONFORMAL=1.
+            use_adaptive = os.getenv("FORECAST_ADAPTIVE_CONFORMAL", "0") == "1"
+            if use_adaptive:
+                buy_disabled = os.getenv("FORECAST_BUY_DISABLED", "0") == "1"
+                short_disabled = os.getenv("FORECAST_SHORT_DISABLED", "0") == "1"
+                adaptive_set: list = []
+                if (not buy_disabled) and calibrated_prob >= self.buy_threshold:
+                    adaptive_set.append("up")
+                if (not short_disabled) and calibrated_prob <= self.sell_threshold:
+                    adaptive_set.append("down")
+                prediction_set = adaptive_set
+                # Expose q90 set for diagnostics
+                if q90_set is not None:
+                    result["prediction_set_q90"] = q90_set
+            elif q90_set is not None:
+                prediction_set = q90_set
+            else:
+                prediction_set = None
+
+            if prediction_set is not None:
                 result["prediction_set"] = prediction_set
 
                 # If both labels are in the set, prediction is uncertain

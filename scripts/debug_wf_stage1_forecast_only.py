@@ -71,6 +71,80 @@ from utils.macro_fundamental_provider import (
 )
 from utils.yfinance_cache import get_historical_data
 
+# Layer 1 adaptive thresholds — reuse the implementation already validated
+# in run_walk_forward_backtest.py (same calibrated-space search logic).
+from scripts.run_walk_forward_backtest import derive_adaptive_thresholds
+
+
+# ── Platt Scaling calibrator ─────────────────────────────────────────────
+# A sigmoid-based monotonic calibrator as an alternative to isotonic.
+# Isotonic can produce sharp step plateaus at the tails (e.g. calibrated
+# prob collapsing onto a single 0.98 step when the training set is heavily
+# long-biased), which then makes adaptive-threshold search ineffective.
+# Platt fits a simple sigmoid (logistic regression on raw_prob) and always
+# yields a smooth, strictly monotone mapping — no plateaus.
+
+class _PlattCalibrator:
+    """Sigmoid (Platt) calibrator with an sklearn-like `.predict(x)` API.
+
+    Internally fits `LogisticRegression` on feature = raw_prob, label = y.
+    `predict(x)` returns the calibrated P(y=1 | raw_prob=x) as a 1-D array,
+    matching the interface already used for isotonic (`calibrator.predict`).
+    """
+
+    def __init__(self, lr):
+        self._lr = lr
+
+    def predict(self, x):
+        arr = np.asarray(x, dtype=float).reshape(-1, 1)
+        probs = self._lr.predict_proba(arr)[:, 1]
+        return probs
+
+
+def fit_platt_calibrator(oof_raw, y, verbose: bool = False):
+    """Fit a Platt (sigmoid) calibrator on OOF predictions.
+
+    Returns a `_PlattCalibrator` exposing `.predict()`, or None if fitting
+    is infeasible (too few valid samples or degenerate labels).
+    """
+    try:
+        from sklearn.linear_model import LogisticRegression
+    except Exception as exc:
+        if verbose:
+            print(f"    [Platt] sklearn import failed: {exc}")
+        return None
+
+    raw = np.asarray(oof_raw, dtype=float)
+    yv = np.asarray(y, dtype=float)
+    mask = ~np.isnan(raw) & ~np.isnan(yv)
+    raw = raw[mask]
+    yv = yv[mask]
+
+    if raw.size < 60:
+        if verbose:
+            print(f"    [Platt] Only {raw.size} valid OOF samples — skip")
+        return None
+    # Need both classes present for logistic regression
+    if yv.min() == yv.max():
+        if verbose:
+            print("    [Platt] OOF labels are all one class — skip")
+        return None
+
+    lr = LogisticRegression(solver="lbfgs", max_iter=200)
+    try:
+        lr.fit(raw.reshape(-1, 1), yv.astype(int))
+    except Exception as exc:
+        if verbose:
+            print(f"    [Platt] fit failed: {exc}")
+        return None
+
+    if verbose:
+        coef = float(lr.coef_.ravel()[0])
+        intercept = float(lr.intercept_.ravel()[0])
+        print(f"    [Platt] fitted sigmoid: coef={coef:+.3f}, intercept={intercept:+.3f} "
+              f"(n_oof={raw.size})")
+    return _PlattCalibrator(lr)
+
 
 # ── Regime computation helpers (mirroring train pipeline) ────────────────
 
@@ -323,22 +397,24 @@ def train_model_for_window(
     embargo_days: int = 10,
     half_life: int = 252,
     verbose: bool = False,
-) -> Tuple[Optional[Any], Optional[Dict], List[str]]:
+) -> Tuple[Optional[Any], Optional[Dict], List[str], Optional[np.ndarray], Optional[np.ndarray]]:
     """Train a LightGBM model on the given time window.
 
     Returns:
-        (lgb_model, meta_dict, macro_fund_cols_used)
+        (lgb_model, meta_dict, macro_fund_cols_used, oof_predictions, y)
+    oof_predictions & y are kept so the caller can optionally fit a
+    probability calibrator on them.
     """
     data = raw_data.get(ticker)
     if data is None or data.empty:
-        return None, None, []
+        return None, None, [], None, None
 
     # Filter to training window
     data = data[(data.index >= train_start) & (data.index <= train_end)].copy()
     if len(data) < 120:
         if verbose:
             print(f"    [skip] Only {len(data)} rows in training window (need >= 120)")
-        return None, None, []
+        return None, None, [], None, None
 
     # Step 1: Compute base features + labels
     frame = compute_base_features(data)
@@ -351,7 +427,7 @@ def train_model_for_window(
     if len(frame) < 100:
         if verbose:
             print(f"    [skip] Only {len(frame)} valid rows after feature computation")
-        return None, None, []
+        return None, None, [], None, None
 
     # Step 2: Compute regime features
     regime_tm_path = os.getenv(
@@ -517,7 +593,7 @@ def train_model_for_window(
     except Exception as exc:
         if verbose:
             print(f"    [error] Training failed: {exc}")
-        return None, None, []
+        return None, None, [], None, None, None
 
     # Build meta dict
     meta = {
@@ -538,7 +614,13 @@ def train_model_for_window(
         ],
     }
 
-    return final_model, meta, macro_fund_cols_used
+    # Extract future returns aligned with oof_predictions / y for Layer 1
+    # adaptive threshold derivation.
+    future_returns_np = None
+    if "future_return" in frame.columns:
+        future_returns_np = frame["future_return"].values.astype(np.float64)
+
+    return final_model, meta, macro_fund_cols_used, oof_predictions, y, future_returns_np
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -551,11 +633,13 @@ def score_features(
     meta: dict,
     regime_features: dict | None = None,
     macro_fund_row: dict | None = None,
+    calibrator=None,
 ) -> float:
-    """Score features with LightGBM model and return raw probability.
+    """Score features with LightGBM model and return probability.
 
-    Uses raw probability directly (no calibrator) to avoid over-smoothing
-    and cross-model probability drift issues in walk-forward setting.
+    If a calibrator is passed in, the raw LightGBM probability is passed
+    through `calibrator.predict(...)` before being returned; otherwise the
+    raw probability is returned as-is (original behaviour).
     """
     feature_cols = meta.get("feature_columns", [])
     regime_cols = meta.get("regime_features", [])
@@ -588,8 +672,15 @@ def score_features(
     X = pd.DataFrame([row])[all_cols]
     raw_prob = float(model.predict(X)[0])
 
-    return raw_prob
+    if calibrator is not None:
+        try:
+            cal_prob = float(calibrator.predict([raw_prob])[0])
+            # Safety clip — matches the downstream Stage 3 behaviour
+            return max(0.02, min(0.98, cal_prob))
+        except Exception:
+            return raw_prob
 
+    return raw_prob
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Monthly Backtest Engine (simplified — no RegimeAgent, no RiskAgent)
@@ -610,6 +701,7 @@ def run_month_backtest(
     cost_bps: float = 5.0,
     slippage_bps: float = 5.0,
     verbose: bool = False,
+    calibrator=None,
 ) -> Tuple[List[dict], float, dict]:
     """Run forecast-only backtest for a single month.
 
@@ -670,6 +762,7 @@ def run_month_backtest(
             features, lgb_model, meta,
             regime_features=regime_feats,
             macro_fund_row=mf_row,
+            calibrator=calibrator,
         )
 
         # Decision: simple threshold
@@ -1060,9 +1153,48 @@ def main():
     parser.add_argument("--train-years", type=int, default=5, help="Rolling training window in years (default: 5)")
     parser.add_argument("--horizon", type=int, default=5, help="Holding period in days (default: 5)")
     parser.add_argument("--threshold", type=float, default=0.50, help="Buy/sell threshold (default: 0.50)")
+    # Layer 1 adaptive thresholds (per-month, per-ticker, calibrated-space)
+    parser.add_argument(
+        "--adaptive-thresholds",
+        dest="adaptive_thresholds",
+        action="store_true",
+        default=True,
+        help="Layer 1: per-month per-ticker adaptive buy/sell thresholds derived from "
+             "OOF *calibrated* probabilities. Overrides --threshold each month. "
+             "Enabled by default (pass --no-adaptive-thresholds to disable).",
+    )
+    parser.add_argument(
+        "--no-adaptive-thresholds",
+        dest="adaptive_thresholds",
+        action="store_false",
+        help="Disable Layer 1 adaptive thresholds and fall back to the static --threshold value.",
+    )
+    parser.add_argument("--buy-min-precision", type=float, default=0.55,
+                        help="Min empirical up-rate for a buy-threshold bin (Layer 1). Default: 0.55")
+    parser.add_argument("--sell-min-precision", type=float, default=0.55,
+                        help="Min empirical down-rate for a sell-threshold bin (Layer 1). Default: 0.55")
+    parser.add_argument("--adaptive-min-support", type=int, default=30,
+                        help="Min samples required in a threshold bin (Layer 1). Default: 30")
+    parser.add_argument("--adaptive-fallback-buy", type=float, default=0.55,
+                        help="Fallback buy threshold when OOF too small (Layer 1). Default: 0.55")
+    parser.add_argument("--adaptive-fallback-sell", type=float, default=0.45,
+                        help="Fallback sell threshold when OOF too small (Layer 1). Default: 0.45")
+    parser.add_argument("--long-only", action="store_true",
+                        help="Long-only mode: force month_sell_th=-1.0 so SELL signals never fire. "
+                             "Useful for single-direction ETFs (e.g. QQQ/SPY) where shorting against "
+                             "the long-run drift destroys edge.")
     parser.add_argument("--cv-folds", type=int, default=5, help="CV folds for training (default: 5)")
     parser.add_argument("--cost-bps", type=float, default=5.0, help="Transaction cost bps (default: 5.0)")
     parser.add_argument("--slippage-bps", type=float, default=5.0, help="Slippage bps (default: 5.0)")
+    parser.add_argument(
+        "--calibrator",
+        type=str,
+        default="isotonic",
+        choices=["none", "isotonic", "platt"],
+        help="Probability calibrator: 'isotonic' (default, sklearn IsotonicRegression fitted per-month on OOF preds), "
+             "'platt' (sigmoid via LogisticRegression on raw_prob — smooth monotone, avoids isotonic step plateaus), "
+             "'none' (raw LightGBM prob).",
+    )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
@@ -1080,7 +1212,12 @@ def main():
     print(f"  Training window: {args.train_years} years (rolling)")
     print(f"  Retrain freq:    monthly")
     print(f"  Horizon:         {args.horizon}d")
-    print(f"  Thresholds:      buy > {buy_threshold}, sell < {sell_threshold}")
+    if args.adaptive_thresholds:
+        print(f"  Thresholds:      ADAPTIVE (Layer 1, calibrated-space, per-month)")
+        print(f"                   min_precision buy={args.buy_min_precision} sell={args.sell_min_precision}, "
+              f"min_support={args.adaptive_min_support}")
+    else:
+        print(f"  Thresholds:      buy > {buy_threshold}, sell < {sell_threshold} (static)")
     print(f"  Costs:           {args.cost_bps}bps + {args.slippage_bps}bps slippage")
     print(f"  CV folds:        {args.cv_folds}")
     print()
@@ -1243,7 +1380,7 @@ def main():
         # Use absolute return labels (spy_data=None) instead of excess return
         # to avoid label-semantic mismatch with long/short trading decisions
         print(f"  [Train] Training model on {args.train_years}-year window (absolute return label) ...")
-        lgb_model, meta, mf_cols_used = train_model_for_window(
+        lgb_model, meta, mf_cols_used, oof_preds, y_train, future_returns_train = train_model_for_window(
             ticker=ticker,
             raw_data=raw_data,
             spy_data=None,
@@ -1269,6 +1406,51 @@ def main():
         n_mf = len(mf_cols_used)
         print(f"  [Train] CV AUC: {cv_auc:.4f}, samples: {n_train}, macro/fund features: {n_mf}")
 
+        # 4a+: Optionally fit a probability calibrator on OOF predictions
+        calibrator = None
+        if args.calibrator == "isotonic" and oof_preds is not None and y_train is not None:
+            try:
+                from pipelines.train_forecast_model import fit_real_isotonic_calibrator
+                calibrator = fit_real_isotonic_calibrator(
+                    oof_preds, y_train, verbose=args.verbose
+                )
+                if calibrator is None:
+                    print("  [Calibrator] Isotonic fit returned None (too few valid OOF samples); using raw prob")
+            except Exception as exc:
+                print(f"  [Calibrator] Isotonic fit failed: {exc}; using raw prob")
+                calibrator = None
+        elif args.calibrator == "platt" and oof_preds is not None and y_train is not None:
+            calibrator = fit_platt_calibrator(oof_preds, y_train, verbose=True)
+            if calibrator is None:
+                print("  [Calibrator] Platt fit returned None; using raw prob")
+
+        # 4a++: Layer 1 — derive per-month adaptive thresholds on calibrated probs
+        month_buy_th = buy_threshold
+        month_sell_th = sell_threshold
+        month_adaptive_info: Optional[Dict[str, Any]] = None
+        if args.adaptive_thresholds and oof_preds is not None and y_train is not None:
+            month_adaptive_info = derive_adaptive_thresholds(
+                oof_raw=oof_preds,
+                y=y_train,
+                future_returns=future_returns_train,
+                calibrator=calibrator,
+                buy_min_precision=args.buy_min_precision,
+                sell_min_precision=args.sell_min_precision,
+                min_support=args.adaptive_min_support,
+                fallback_buy=args.adaptive_fallback_buy,
+                fallback_sell=args.adaptive_fallback_sell,
+                verbose=True,
+            )
+            month_buy_th = month_adaptive_info["buy_threshold"]
+            month_sell_th = month_adaptive_info["sell_threshold"]
+
+        # Long-only override: kill SELL side entirely (prob < -1.0 is never true)
+        if getattr(args, "long_only", False):
+            month_sell_th = -1.0
+            if month_adaptive_info is not None:
+                month_adaptive_info["sell_threshold"] = -1.0
+                month_adaptive_info["short_disabled"] = True
+
         # 4b: Run backtest for this month (out-of-sample)
         print(f"  [Trade] Running forecast-only backtest ...")
         month_trades, equity, month_equity_curve = run_month_backtest(
@@ -1281,11 +1463,12 @@ def main():
             month_end=month_end,
             equity_start=equity,
             horizon=args.horizon,
-            buy_threshold=buy_threshold,
-            sell_threshold=sell_threshold,
+            buy_threshold=month_buy_th,
+            sell_threshold=month_sell_th,
             cost_bps=args.cost_bps,
             slippage_bps=args.slippage_bps,
             verbose=args.verbose,
+            calibrator=calibrator,
         )
 
         elapsed = time.time() - month_time
@@ -1307,12 +1490,19 @@ def main():
 
         all_trades.extend(month_trades)
         all_equity_curve.update(month_equity_curve)
-        monthly_results.append({
+        month_record = {
             "month": month_label,
             "trades": month_trades,
             "cv_auc": cv_auc,
             "n_train": n_train,
-        })
+        }
+        if month_adaptive_info is not None:
+            month_record["adaptive_buy_threshold"] = month_adaptive_info["buy_threshold"]
+            month_record["adaptive_sell_threshold"] = month_adaptive_info["sell_threshold"]
+            month_record["adaptive_buy_disabled"] = month_adaptive_info["buy_disabled"]
+            month_record["adaptive_short_disabled"] = month_adaptive_info["short_disabled"]
+            month_record["adaptive_mode"] = month_adaptive_info.get("mode", "adaptive")
+        monthly_results.append(month_record)
 
     # ── Step 5: Compute benchmark return ─────────────────────────────────
     total_elapsed = time.time() - total_start_time
@@ -1346,6 +1536,13 @@ def main():
         "sell_threshold": sell_threshold,
         "cost_bps": args.cost_bps,
         "slippage_bps": args.slippage_bps,
+        "calibrator": args.calibrator,
+        "adaptive_thresholds": args.adaptive_thresholds,
+        "buy_min_precision": args.buy_min_precision,
+        "sell_min_precision": args.sell_min_precision,
+        "adaptive_min_support": args.adaptive_min_support,
+        "adaptive_fallback_buy": args.adaptive_fallback_buy,
+        "adaptive_fallback_sell": args.adaptive_fallback_sell,
     }
 
     print_report(metrics, monthly_perf, config)
@@ -1355,7 +1552,11 @@ def main():
     output_dir = Path("data/backtest_results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    base_name = f"wf_stage1_{ticker}_{args.start}_{args.end}_t{args.threshold}"
+    base_name = f"wf_stage1_{ticker}_{args.start}_{args.end}_t{args.threshold}_cal-{args.calibrator}"
+    if args.adaptive_thresholds:
+        base_name += "_adaptive"
+    if getattr(args, "long_only", False):
+        base_name += "_longonly"
 
     # Save report JSON
     report_path = output_dir / f"{base_name}_report.json"

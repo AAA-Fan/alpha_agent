@@ -71,6 +71,7 @@ from pipelines.train_forecast_model import (
     compute_sample_weights,
     train_lgb_model,
     fit_isotonic_calibrator,
+    fit_real_isotonic_calibrator,
     compute_conformal_scores,
     BASE_FEATURE_COLUMNS,
     REGIME_FEATURE_COLUMNS,
@@ -83,11 +84,71 @@ from utils.macro_fundamental_provider import (
 )
 from utils.yfinance_cache import get_historical_data
 
+# Layer 1 adaptive thresholds — reuse the implementation already validated
+# in run_walk_forward_backtest.py (same calibrated-space search logic).
+from scripts.run_walk_forward_backtest import derive_adaptive_thresholds
 
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Platt Scaling calibrator ─────────────────────────────────────────────
+# A sigmoid-based monotonic calibrator as an alternative to isotonic.
+# Isotonic can produce sharp step plateaus at the tails (e.g. calibrated
+# prob collapsing onto a single 0.98 step on long-bias ETFs such as QQQ),
+# which then makes adaptive-threshold search ineffective. Platt fits a
+# simple sigmoid (logistic regression on raw_prob) and always yields a
+# smooth, strictly monotone mapping — no plateaus.
+
+class _PlattCalibrator:
+    """Sigmoid (Platt) calibrator with an sklearn-like `.predict(x)` API."""
+
+    def __init__(self, lr):
+        self._lr = lr
+
+    def predict(self, x):
+        arr = np.asarray(x, dtype=float).reshape(-1, 1)
+        return self._lr.predict_proba(arr)[:, 1]
+
+
+def fit_platt_calibrator(oof_raw, y, verbose: bool = False):
+    """Fit a Platt (sigmoid) calibrator on OOF predictions."""
+    try:
+        from sklearn.linear_model import LogisticRegression
+    except Exception as exc:
+        if verbose:
+            print(f"    [Platt] sklearn import failed: {exc}")
+        return None
+
+    raw = np.asarray(oof_raw, dtype=float)
+    yv = np.asarray(y, dtype=float)
+    mask = ~np.isnan(raw) & ~np.isnan(yv)
+    raw = raw[mask]
+    yv = yv[mask]
+    if raw.size < 60:
+        if verbose:
+            print(f"    [Platt] Only {raw.size} valid OOF samples — skip")
+        return None
+    if yv.min() == yv.max():
+        if verbose:
+            print("    [Platt] OOF labels are all one class — skip")
+        return None
+
+    lr = LogisticRegression(solver="lbfgs", max_iter=200)
+    try:
+        lr.fit(raw.reshape(-1, 1), yv.astype(int))
+    except Exception as exc:
+        if verbose:
+            print(f"    [Platt] fit failed: {exc}")
+        return None
+    if verbose:
+        coef = float(lr.coef_.ravel()[0])
+        intercept = float(lr.intercept_.ravel()[0])
+        print(f"    [Platt] fitted sigmoid: coef={coef:+.3f}, intercept={intercept:+.3f} "
+              f"(n_oof={raw.size})")
+    return _PlattCalibrator(lr)
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # Regime computation helpers (mirroring train pipeline)
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ═════════════════════════════════════════════════════════════════════════
 def _trend_score_from_features(features: dict) -> float:
     score = 0.0
     weights = {
@@ -331,10 +392,17 @@ def train_model_for_window(
     embargo_days: int = 10,
     half_life: int = 252,
     verbose: bool = False,
+    calibrator_type: str = "temperature",
 ) -> Tuple[Optional[Any], Optional[Any], Optional[Dict], List[str]]:
     """Train a LightGBM model on the given time window.
 
     Uses absolute return labels (spy_data=None).
+
+    calibrator_type:
+        - "temperature" (default): legacy 1-param Temperature Scaling.
+        - "isotonic": real non-parametric sklearn IsotonicRegression
+          (Stage 1 benchmark winner: NVDA −40%→−12%, AAPL +60%→+63%).
+        - "none": no calibration, raw LightGBM probabilities.
 
     Returns:
         (lgb_model, calibrator, meta_dict, macro_fund_cols_used)
@@ -527,10 +595,17 @@ def train_model_for_window(
     except Exception as exc:
         if verbose:
             print(f"    [error] Training failed: {exc}")
-        return None, None, None, []
+        return None, None, None, [], None, None, None
 
     # Step 6: Fit calibrator + conformal scores
-    calibrator = fit_isotonic_calibrator(oof_predictions, y)
+    if calibrator_type == "isotonic":
+        calibrator = fit_real_isotonic_calibrator(oof_predictions, y, verbose=verbose)
+    elif calibrator_type == "platt":
+        calibrator = fit_platt_calibrator(oof_predictions, y, verbose=verbose)
+    elif calibrator_type == "none":
+        calibrator = None
+    else:  # "temperature" (default / legacy)
+        calibrator = fit_isotonic_calibrator(oof_predictions, y)
     conformal_info = compute_conformal_scores(oof_predictions, y, calibrator)
 
     # Build meta dict
@@ -553,7 +628,12 @@ def train_model_for_window(
         **conformal_info,
     }
 
-    return final_model, calibrator, meta, macro_fund_cols_used
+    # Extract future returns aligned with oof_predictions / y for Layer 1
+    future_returns_np = None
+    if "future_return" in frame.columns:
+        future_returns_np = frame["future_return"].values.astype(np.float64)
+
+    return final_model, calibrator, meta, macro_fund_cols_used, oof_predictions, y, future_returns_np
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -669,11 +749,45 @@ KELLY_AVG_LOSS = 0.02
 MAX_POSITION_SIZE = 1.0
 MIN_POSITION_THRESHOLD = 0.03
 
-# Stop-loss / take-profit
+# Stop-loss / take-profit (vol-bucket adaptive)
+#   high-vol (vol_20 >= 0.35) -> 3.5x daily_vol  (NVDA, TSLA)
+#   medium-vol                -> 2.5x daily_vol  (AAPL, default)
+#   low-vol  (vol_20 <  0.20) -> 2.0x daily_vol  (KO, defensive)
 RISK_REWARD_RATIO = 2.0
-STOP_VOL_MULTIPLIER = 2.5
+STOP_VOL_MULTIPLIER_HIGH = 3.5
+STOP_VOL_MULTIPLIER_MID = 2.5
+STOP_VOL_MULTIPLIER_LOW = 2.0
+STOP_VOL_HIGH_THR = 0.35
+STOP_VOL_LOW_THR = 0.20
 STOP_MIN = 0.01
-STOP_MAX = 0.08
+STOP_MAX = 0.12  # raised from 0.08 so the high-vol bucket actually takes effect
+
+# Probability-conviction Kelly scaling (B2).
+# See agents/risk_agent.py for the full rationale. Anchored on Layer-1
+# per-month adaptive buy/sell thresholds (not hard-coded 0.55/0.45).
+try:
+    PROB_CONVICTION_ALPHA = float(os.getenv("RISK_PROB_CONVICTION_ALPHA", "3.0"))
+except (TypeError, ValueError):
+    PROB_CONVICTION_ALPHA = 3.0
+FALLBACK_BUY_THRESHOLD = 0.55
+FALLBACK_SELL_THRESHOLD = 0.45
+
+
+def compute_probability_conviction(
+    action: str,
+    probability_up: float,
+    buy_threshold: float,
+    sell_threshold: float,
+    alpha: float = PROB_CONVICTION_ALPHA,
+) -> float:
+    """Return multiplier >= 1.0 based on distance beyond the Layer-1 cutoff."""
+    if action == "buy":
+        edge = max(0.0, probability_up - buy_threshold)
+    elif action == "sell":
+        edge = max(0.0, sell_threshold - probability_up)
+    else:
+        return 1.0
+    return 1.0 + alpha * edge
 
 
 def compute_prediction_kelly(
@@ -701,17 +815,61 @@ def compute_prediction_kelly(
     return min(full_kelly, MAX_POSITION_SIZE)
 
 
+def adaptive_prediction_set(
+    p_cal: float,
+    buy_threshold: float,
+    sell_threshold: float,
+    buy_disabled: bool = False,
+    short_disabled: bool = False,
+) -> list:
+    """Build conformal prediction set aligned with Layer-1 adaptive thresholds.
+
+    Instead of using the training-time OOF q90 (which is too wide for high-
+    volatility tickers like NVDA and rejects most valid signals), we derive
+    ambiguity directly from the per-month buy/sell thresholds that Layer-1
+    already validated to hit precision>=55%. This keeps the conformal filter
+    semantically aligned with the decision thresholds:
+
+      * If Layer-1 enabled buying for this month and p_cal >= buy_threshold
+        -> "up" enters the set (model is confident enough to buy).
+      * If Layer-1 enabled shorting and p_cal <= sell_threshold
+        -> "down" enters the set.
+      * If a direction is disabled by Layer-1, it NEVER enters the set,
+        which prevents the RiskAgent from silently reviving it.
+
+    Resulting behaviour:
+      |set| == 0 : prob in Layer-1 neutral zone -> will be rejected (reject_reason=conformal_empty)
+      |set| == 1 : one-sided confidence -> normal trade
+      |set| == 2 : mathematically impossible when buy_threshold > sell_threshold
+                   (Layer-1 guarantees this), kept as a safety net.
+    """
+    pred_set: list = []
+    if (not buy_disabled) and p_cal >= buy_threshold:
+        pred_set.append("up")
+    if (not short_disabled) and p_cal <= sell_threshold:
+        pred_set.append("down")
+    return pred_set
+
+
 def simplified_risk_plan(
     action: str,
     probability_up: float,
     volatility_20: float,
     horizon_days: int = 5,
     uncertainty_info: dict | None = None,
+    buy_threshold: float = FALLBACK_BUY_THRESHOLD,
+    sell_threshold: float = FALLBACK_SELL_THRESHOLD,
+    full_position: bool = False,
 ) -> dict:
     """Simplified RiskAgent: Prediction Kelly + conformal uncertainty + stop-loss.
 
     Steps:
       ① Prediction Kelly position sizing
+      ①b Probability-conviction scaling (Layer-1-anchored)
+            OR, if ``full_position=True``: skip Kelly*conviction and
+            lock the position at MAX_POSITION_SIZE whenever a trade is
+            taken. The negative-EV / conformal / stop-TP guards stay
+            fully active; only the fractional Kelly sizing is bypassed.
       ② Uncertainty filtering (conformal + tree dispersion)
       ③ Direction judgment
       ④ Minimum position threshold
@@ -737,7 +895,26 @@ def simplified_risk_plan(
             "risk_flags": ["negative_expected_value"],
         }
 
-    position_size = kelly
+    # ①b Position sizing: Kelly * prob_conviction  OR  full-position lock.
+    if full_position:
+        # Full-position mode: bypass fractional Kelly and conviction scaling.
+        # Negative-EV was already rejected above; Conformal, high tree
+        # dispersion, stop-loss / take-profit and min-position guards
+        # below remain fully active.
+        position_size = MAX_POSITION_SIZE
+        prob_conviction = 1.0
+        risk_flags.append("kelly_locked_full")
+    else:
+        # Probability-conviction scaling (Layer-1-anchored).
+        prob_conviction = compute_probability_conviction(
+            action=action,
+            probability_up=probability_up,
+            buy_threshold=buy_threshold,
+            sell_threshold=sell_threshold,
+        )
+        position_size = min(kelly * prob_conviction, MAX_POSITION_SIZE)
+        if prob_conviction > 1.0:
+            risk_flags.append("prob_conviction_boost")
 
     # ── ② Uncertainty-aware filtering (Conformal Prediction) ─────────────
     if uncertainty_info is not None:
@@ -757,13 +934,19 @@ def simplified_risk_plan(
             risk_flags.append("high_tree_dispersion")
 
     # ── ③ Direction ──────────────────────────────────────────────────────
+    # Align with agents/risk_agent.py (production path):
+    # hold → direction = 0 → no trade. Do NOT take a reverse quarter-Kelly
+    # position based on prob, which would silently bypass Layer-1 adaptive
+    # thresholds (e.g. sell_threshold=-0.5 means "shorts disabled").
     if action == "buy":
         direction = 1
     elif action == "sell":
         direction = -1
     else:
-        direction = 1 if probability_up > 0.5 else -1
-        position_size *= 0.25
+        direction = 0
+        position_size = 0.0
+        if reject_reason is None:
+            reject_reason = "no_strong_edge"
         risk_flags.append("no_strong_edge")
 
     position_size = direction * position_size
@@ -777,9 +960,15 @@ def simplified_risk_plan(
         reject_reason = reject_reason or "position_too_small"
         risk_flags.append("position_too_small")
 
-    # ── ⑤ Dynamic stop-loss / take-profit ───────────────────────────────
+    # ── ⑤ Dynamic stop-loss / take-profit (vol-bucket adaptive) ─────────
     daily_vol = volatility_20 / math.sqrt(252.0)
-    base_stop = daily_vol * STOP_VOL_MULTIPLIER
+    if volatility_20 >= STOP_VOL_HIGH_THR:
+        stop_multiplier = STOP_VOL_MULTIPLIER_HIGH
+    elif volatility_20 < STOP_VOL_LOW_THR:
+        stop_multiplier = STOP_VOL_MULTIPLIER_LOW
+    else:
+        stop_multiplier = STOP_VOL_MULTIPLIER_MID
+    base_stop = daily_vol * stop_multiplier
     stop_loss_pct = min(STOP_MAX, max(STOP_MIN, base_stop))
     take_profit_pct = stop_loss_pct * RISK_REWARD_RATIO
 
@@ -814,6 +1003,10 @@ def run_month_backtest_stage2(
     cost_bps: float = 5.0,
     slippage_bps: float = 5.0,
     verbose: bool = False,
+    buy_disabled: bool = False,
+    short_disabled: bool = False,
+    use_adaptive_conformal: bool = True,
+    full_position: bool = False,
 ) -> Tuple[List[dict], float, dict, dict]:
     """Run Stage 2 backtest for a single month (with RiskAgent).
 
@@ -846,6 +1039,10 @@ def run_month_backtest_stage2(
         "took_profit": 0,
         "horizon_exit": 0,
         "high_tree_dispersion": 0,
+        # Adaptive conformal vs legacy q90 comparison counters
+        "conformal_mode": "adaptive" if use_adaptive_conformal else "q90",
+        "adaptive_vs_q90_overrides": 0,   # adaptive passes but q90 would ambig
+        "adaptive_vs_q90_extra_reject": 0, # adaptive rejects but q90 would pass
     }
 
     t = start_idx
@@ -880,6 +1077,29 @@ def run_month_backtest_stage2(
             macro_fund_row=mf_row,
         )
 
+        # ── Adaptive conformal override ──────────────────────────────────
+        # Replace the training-time q90-based prediction_set with one that is
+        # aligned with Layer-1's per-month buy/sell thresholds. Keep the
+        # original q90 set for diagnostics. See adaptive_prediction_set() doc.
+        if use_adaptive_conformal and uncertainty_info is not None:
+            q90_set = uncertainty_info.get("prediction_set") or []
+            adaptive_set = adaptive_prediction_set(
+                p_cal=prob,
+                buy_threshold=buy_threshold,
+                sell_threshold=sell_threshold,
+                buy_disabled=buy_disabled,
+                short_disabled=short_disabled,
+            )
+            uncertainty_info["prediction_set_q90"] = q90_set
+            uncertainty_info["prediction_set"] = adaptive_set
+            # Track disagreements between the two schemes
+            q90_ambig = (len(q90_set) != 1)
+            adp_ambig = (len(adaptive_set) != 1)
+            if q90_ambig and not adp_ambig:
+                risk_stats["adaptive_vs_q90_overrides"] += 1
+            elif (not q90_ambig) and adp_ambig:
+                risk_stats["adaptive_vs_q90_extra_reject"] += 1
+
         # Decision: threshold
         if prob > buy_threshold:
             action = "buy"
@@ -897,6 +1117,9 @@ def run_month_backtest_stage2(
             volatility_20=features.get("volatility_20", 0.25),
             horizon_days=horizon,
             uncertainty_info=uncertainty_info,
+            buy_threshold=buy_threshold,
+            sell_threshold=sell_threshold,
+            full_position=full_position,
         )
 
         position_size = risk_plan["position_size"]
@@ -1050,8 +1273,18 @@ def run_month_backtest_stage1(
     cost_bps: float = 5.0,
     slippage_bps: float = 5.0,
     verbose: bool = False,
+    calibrator: Any = None,
+    buy_disabled: bool = False,
+    short_disabled: bool = False,
 ) -> Tuple[List[dict], float, dict]:
-    """Run Stage 1 backtest for a single month (no RiskAgent, for comparison)."""
+    """Run Stage 1 backtest for a single month (no RiskAgent, for comparison).
+
+    NOTE: S1 must use the **same calibrated-probability space** as S2 so that
+    Layer-1 adaptive thresholds (which are derived on calibrated OOF probs)
+    are compared against a consistent decision variable. Otherwise S1 trades
+    are judged in raw-prob space while the threshold lives in calibrated space,
+    and the S1 vs S2 comparison becomes meaningless.
+    """
     dates = ohlcv_data.index
     open_prices = pd.to_numeric(ohlcv_data["Open"], errors="coerce").values
     close_prices = pd.to_numeric(ohlcv_data["Close"], errors="coerce").values
@@ -1088,18 +1321,18 @@ def run_month_backtest_stage1(
             if len(valid_dates) > 0:
                 mf_row = macro_fund_df.loc[valid_dates[-1]].to_dict()
 
-        # Score (raw only, no calibrator for stage1)
-        raw_prob, _, _ = score_features(
-            features, lgb_model, meta, None,
+        # Score (use calibrator so S1 and S2 live in the same probability space).
+        raw_prob, prob, _ = score_features(
+            features, lgb_model, meta, calibrator,
             regime_features=regime_feats,
             macro_fund_row=mf_row,
         )
-        prob = raw_prob
 
-        if prob > buy_threshold:
+        # Apply Layer-1 buy/short disable flags (same logic as S2 entry gate)
+        if prob > buy_threshold and not buy_disabled:
             action = "buy"
             direction = 1.0
-        elif prob < sell_threshold:
+        elif prob < sell_threshold and not short_disabled:
             action = "sell"
             direction = -1.0
         else:
@@ -1130,6 +1363,7 @@ def run_month_backtest_stage1(
                 "date": current_date.strftime("%Y-%m-%d"),
                 "action": action,
                 "probability_up": round(prob, 6),
+                "raw_probability_up": round(float(raw_prob), 6),
                 "direction": direction,
                 "entry_price": round(float(entry_price), 4),
                 "exit_price": round(float(exit_price), 4),
@@ -1444,9 +1678,74 @@ def main():
     parser.add_argument("--train-years", type=int, default=5, help="Rolling training window in years (default: 5)")
     parser.add_argument("--horizon", type=int, default=5, help="Holding period in days (default: 5)")
     parser.add_argument("--threshold", type=float, default=0.50, help="Buy/sell threshold (default: 0.50)")
+    # Layer 1 adaptive thresholds (per-month, per-ticker, calibrated-space)
+    parser.add_argument(
+        "--adaptive-thresholds",
+        dest="adaptive_thresholds",
+        action="store_true",
+        default=True,
+        help="Layer 1: per-month per-ticker adaptive buy/sell thresholds derived from "
+             "OOF *calibrated* probabilities. Overrides --threshold each month. "
+             "Enabled by default (pass --no-adaptive-thresholds to disable).",
+    )
+    parser.add_argument(
+        "--no-adaptive-thresholds",
+        dest="adaptive_thresholds",
+        action="store_false",
+        help="Disable Layer 1 adaptive thresholds and fall back to the static --threshold value.",
+    )
+    parser.add_argument("--buy-min-precision", type=float, default=0.55,
+                        help="Min empirical up-rate for a buy-threshold bin (Layer 1). Default: 0.55")
+    parser.add_argument("--sell-min-precision", type=float, default=0.55,
+                        help="Min empirical down-rate for a sell-threshold bin (Layer 1). Default: 0.55")
+    parser.add_argument("--adaptive-min-support", type=int, default=30,
+                        help="Min samples required in a threshold bin (Layer 1). Default: 30")
+    parser.add_argument("--adaptive-fallback-buy", type=float, default=0.55,
+                        help="Fallback buy threshold when OOF too small (Layer 1). Default: 0.55")
+    parser.add_argument("--adaptive-fallback-sell", type=float, default=0.45,
+                        help="Fallback sell threshold when OOF too small (Layer 1). Default: 0.45")
+    # Adaptive conformal prediction set (binds ambiguity to Layer-1 thresholds)
+    parser.add_argument(
+        "--adaptive-conformal",
+        action="store_true",
+        default=True,
+        help="Replace training-time q90-based conformal set with one aligned to "
+             "Layer-1 adaptive buy/sell thresholds. Enabled by default (pass "
+             "--no-adaptive-conformal to disable).",
+    )
+    parser.add_argument(
+        "--no-adaptive-conformal",
+        dest="adaptive_conformal",
+        action="store_false",
+        help="Fallback to the legacy q90-based conformal prediction set.",
+    )
     parser.add_argument("--cv-folds", type=int, default=5, help="CV folds for training (default: 5)")
     parser.add_argument("--cost-bps", type=float, default=5.0, help="Transaction cost bps (default: 5.0)")
     parser.add_argument("--slippage-bps", type=float, default=5.0, help="Slippage bps (default: 5.0)")
+    parser.add_argument(
+        "--calibrator",
+        type=str,
+        default="isotonic",
+        choices=["temperature", "isotonic", "platt", "none"],
+        help="Probability calibrator: 'isotonic' (default, sklearn IsotonicRegression — Stage 1 benchmark winner), "
+             "'platt' (sigmoid via LogisticRegression on raw_prob — smooth monotone, avoids isotonic step plateaus), "
+             "'temperature' (legacy 1-param T-scaling), 'none' (raw LightGBM prob)",
+    )
+    parser.add_argument(
+        "--long-only",
+        action="store_true",
+        help="Disable SHORT side entirely (sell_threshold forced to -1.0 so prob < sell is never true).",
+    )
+    parser.add_argument(
+        "--full-position",
+        action="store_true",
+        help="Kelly-lock switch: when enabled, every trade that passes the "
+             "EV / conformal / tree-dispersion / track-record guards is "
+             "sized at MAX_POSITION_SIZE instead of Kelly*conviction. "
+             "Useful for low/mid-volatility names (QQQ, AAPL) where "
+             "fractional Kelly is the dominant Stage2 drag. High-vol names "
+             "(NVDA, TSLA) usually prefer fractional Kelly.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
@@ -1464,7 +1763,12 @@ def main():
     print(f"  Training window: {args.train_years} years (rolling)")
     print(f"  Retrain freq:    monthly")
     print(f"  Horizon:         {args.horizon}d")
-    print(f"  Thresholds:      buy > {buy_threshold}, sell < {sell_threshold}")
+    if args.adaptive_thresholds:
+        print(f"  Thresholds:      ADAPTIVE (Layer 1, calibrated-space, per-month)")
+        print(f"                   min_precision buy={args.buy_min_precision} sell={args.sell_min_precision}, "
+              f"min_support={args.adaptive_min_support}")
+    else:
+        print(f"  Thresholds:      buy > {buy_threshold}, sell < {sell_threshold} (static)")
     print(f"  Costs:           {args.cost_bps}bps + {args.slippage_bps}bps slippage")
     print(f"  Label:           absolute return")
     print(f"  CV folds:        {args.cv_folds}")
@@ -1621,7 +1925,7 @@ def main():
 
         # 4a: Train model (absolute return label)
         print(f"  [Train] Training model on {args.train_years}-year window (absolute return label) ...")
-        lgb_model, calibrator, meta, mf_cols_used = train_model_for_window(
+        lgb_model, calibrator, meta, mf_cols_used, oof_preds, y_train, future_returns_train = train_model_for_window(
             ticker=ticker,
             raw_data=raw_data,
             train_start=train_start,
@@ -1629,6 +1933,7 @@ def main():
             horizon_days=args.horizon,
             n_splits=args.cv_folds,
             verbose=args.verbose,
+            calibrator_type=args.calibrator,
         )
 
         if lgb_model is None:
@@ -1646,7 +1951,38 @@ def main():
         conformal_q90 = meta.get("conformal_scores_quantiles", {}).get("q90", "N/A")
         print(f"  [Train] CV AUC: {cv_auc:.4f}, samples: {n_train}, conformal q90: {conformal_q90}")
 
+        # 4a+: Layer 1 — derive per-month adaptive thresholds on calibrated probs
+        month_buy_th = buy_threshold
+        month_sell_th = sell_threshold
+        month_adaptive_info: Optional[Dict[str, Any]] = None
+        if args.adaptive_thresholds and oof_preds is not None and y_train is not None:
+            month_adaptive_info = derive_adaptive_thresholds(
+                oof_raw=oof_preds,
+                y=y_train,
+                future_returns=future_returns_train,
+                calibrator=calibrator,
+                buy_min_precision=args.buy_min_precision,
+                sell_min_precision=args.sell_min_precision,
+                min_support=args.adaptive_min_support,
+                fallback_buy=args.adaptive_fallback_buy,
+                fallback_sell=args.adaptive_fallback_sell,
+                verbose=True,
+            )
+            month_buy_th = month_adaptive_info["buy_threshold"]
+            month_sell_th = month_adaptive_info["sell_threshold"]
+
+        # Resolve disabled flags from adaptive info (default = enabled)
+        month_buy_disabled = bool(month_adaptive_info["buy_disabled"]) if month_adaptive_info else False
+        month_short_disabled = bool(month_adaptive_info["short_disabled"]) if month_adaptive_info else False
+
+        # Long-only override: kill SHORT side entirely
+        if getattr(args, "long_only", False):
+            month_sell_th = -1.0
+            month_short_disabled = True
+
         # 4b: Run Stage 1 backtest (no RiskAgent, for comparison)
+        #     S1 now uses the same calibrator + disable flags as S2 so that
+        #     the S1 vs S2 comparison isolates ONLY the RiskAgent effect.
         print(f"  [S1] Running forecast-only backtest ...")
         s1_trades, s1_equity, s1_eq_curve = run_month_backtest_stage1(
             lgb_model=lgb_model,
@@ -1658,11 +1994,14 @@ def main():
             month_end=month_end,
             equity_start=s1_equity,
             horizon=args.horizon,
-            buy_threshold=buy_threshold,
-            sell_threshold=sell_threshold,
+            buy_threshold=month_buy_th,
+            sell_threshold=month_sell_th,
             cost_bps=args.cost_bps,
             slippage_bps=args.slippage_bps,
             verbose=args.verbose,
+            calibrator=calibrator,
+            buy_disabled=month_buy_disabled,
+            short_disabled=month_short_disabled,
         )
 
         # 4c: Run Stage 2 backtest (with RiskAgent)
@@ -1678,16 +2017,24 @@ def main():
             month_end=month_end,
             equity_start=s2_equity,
             horizon=args.horizon,
-            buy_threshold=buy_threshold,
-            sell_threshold=sell_threshold,
+            buy_threshold=month_buy_th,
+            sell_threshold=month_sell_th,
             cost_bps=args.cost_bps,
             slippage_bps=args.slippage_bps,
             verbose=args.verbose,
+            buy_disabled=month_buy_disabled,
+            short_disabled=month_short_disabled,
+            use_adaptive_conformal=args.adaptive_conformal,
+            full_position=getattr(args, "full_position", False),
         )
 
         # Accumulate risk stats
         for k, v in month_risk_stats.items():
-            s2_total_risk_stats[k] = s2_total_risk_stats.get(k, 0) + v
+            if isinstance(v, (int, float)):
+                s2_total_risk_stats[k] = s2_total_risk_stats.get(k, 0) + v
+            else:
+                # Non-numeric fields (e.g. conformal_mode) — record once
+                s2_total_risk_stats.setdefault(k, v)
 
         elapsed = time.time() - month_time
         month_label = month_start.strftime("%Y-%m")
@@ -1715,7 +2062,7 @@ def main():
 
         s1_all_trades.extend(s1_trades)
         s2_all_trades.extend(s2_trades)
-        monthly_perf.append({
+        month_perf_record = {
             "month": month_label,
             "s1_trades": len(s1_trades),
             "s2_trades": len(s2_trades),
@@ -1723,7 +2070,14 @@ def main():
             "s2_return": round(s2_month_ret, 6),
             "s2_hit_rate": round(s2_hit, 4),
             "cv_auc": round(cv_auc, 4),
-        })
+        }
+        if month_adaptive_info is not None:
+            month_perf_record["adaptive_buy_threshold"] = month_adaptive_info["buy_threshold"]
+            month_perf_record["adaptive_sell_threshold"] = month_adaptive_info["sell_threshold"]
+            month_perf_record["adaptive_buy_disabled"] = month_adaptive_info["buy_disabled"]
+            month_perf_record["adaptive_short_disabled"] = month_adaptive_info["short_disabled"]
+            month_perf_record["adaptive_mode"] = month_adaptive_info.get("mode", "adaptive")
+        monthly_perf.append(month_perf_record)
 
     # ── Step 5: Compute benchmark return ─────────────────────────────────
     total_elapsed = time.time() - total_start_time
@@ -1758,6 +2112,12 @@ def main():
         "sell_threshold": sell_threshold,
         "cost_bps": args.cost_bps,
         "slippage_bps": args.slippage_bps,
+        "adaptive_thresholds": args.adaptive_thresholds,
+        "buy_min_precision": args.buy_min_precision,
+        "sell_min_precision": args.sell_min_precision,
+        "adaptive_min_support": args.adaptive_min_support,
+        "adaptive_fallback_buy": args.adaptive_fallback_buy,
+        "adaptive_fallback_sell": args.adaptive_fallback_sell,
     }
 
     print_comparison_report(s1_metrics, s2_metrics, s2_total_risk_stats, monthly_perf, config)
@@ -1766,7 +2126,13 @@ def main():
     output_dir = Path("data/backtest_results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    base_name = f"wf_stage2_{ticker}_{args.start}_{args.end}_t{args.threshold}"
+    base_name = f"wf_stage2_{ticker}_{args.start}_{args.end}_t{args.threshold}_cal-{args.calibrator}"
+    if args.adaptive_thresholds:
+        base_name += "_adaptive"
+    if getattr(args, "long_only", False):
+        base_name += "_longonly"
+    if getattr(args, "full_position", False):
+        base_name += "_fullpos"
 
     # Save report JSON
     report_path = output_dir / f"{base_name}_report.json"

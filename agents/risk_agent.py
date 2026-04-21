@@ -31,6 +31,27 @@ HIGH_CONFIDENCE_OVERRIDE = 0.35    # |prob - 0.5| > this → override reject (pr
 UNCERTAINTY_HIGH_THRESHOLD = 0.15   # above this → reject trade
 UNCERTAINTY_MODERATE_THRESHOLD = 0.10  # above this → reduce position by 30%
 
+# ── Probability-conviction Kelly scaling (B2) ────────────────────────────
+# When the calibrated probability clears Layer-1's adaptive threshold by
+# a wide margin, Kelly alone under-reacts (it is computed on the *raw*
+# probability and is anchored at 0.5). We therefore multiply kelly_fraction
+# by (1 + alpha * edge) where edge is distance beyond the adaptive cutoff.
+#
+#   buy : edge = max(0, p_cal - buy_threshold)
+#   sell: edge = max(0, sell_threshold - p_cal)
+#
+# alpha=3.0 is the "conservative" setting (NVDA p=0.75 vs buy_th=0.58 → ×1.51).
+# Anchoring on the Layer-1 threshold (rather than a hard-coded 0.55) keeps
+# the scaling consistent with whatever cutoff Layer-1 searched for this
+# ticker / month, and symmetric on the sell side.
+PROB_CONVICTION_ALPHA = 0.0
+try:
+    PROB_CONVICTION_ALPHA = float(os.getenv("RISK_PROB_CONVICTION_ALPHA", "3.0"))
+except (TypeError, ValueError):
+    PROB_CONVICTION_ALPHA = 3.0
+FALLBACK_BUY_THRESHOLD = 0.55
+FALLBACK_SELL_THRESHOLD = 0.45
+
 # ── Regime direction score mapping ───────────────────────────────────────
 REGIME_DIRECTION_SCORE: Dict[str, float] = {
     "strong_rally":  +1.0,
@@ -54,6 +75,7 @@ class RiskAgent:
         max_position_size: float | None = None,
         risk_reward_ratio: float | None = None,
         verbose: bool = False,
+        full_position: bool | None = None,
     ) -> None:
         self.target_annual_volatility = target_annual_volatility or float(
             os.getenv("RISK_TARGET_ANNUAL_VOL", "0.12")
@@ -64,6 +86,14 @@ class RiskAgent:
         self.risk_reward_ratio = risk_reward_ratio or float(
             os.getenv("RISK_REWARD_RATIO", "2.0")
         )
+        # Full-position switch: bypass Kelly*conviction shrinkage and bet
+        # MAX_POSITION_SIZE whenever a trade passes every other guard
+        # (EV > 0, conformal, alignment, ...). Driven either by the
+        # constructor arg or the RISK_FULL_POSITION env var ("1"/"true").
+        if full_position is None:
+            env_val = os.getenv("RISK_FULL_POSITION", "").strip().lower()
+            full_position = env_val in ("1", "true", "yes", "on")
+        self.full_position = bool(full_position)
         self.verbose = verbose
 
     # ── Helpers ──────────────────────────────────────────────────────────
@@ -105,6 +135,35 @@ class RiskAgent:
 
         quarter_kelly = full_kelly * 0.25
         return min(quarter_kelly, self.max_position_size)
+
+    def _compute_probability_conviction(
+        self,
+        action: str,
+        probability_up: float,
+        buy_threshold: float,
+        sell_threshold: float,
+        alpha: float = PROB_CONVICTION_ALPHA,
+    ) -> float:
+        """Scale position up when signal strength exceeds Layer-1 threshold.
+
+        Rationale: Kelly is anchored at probability=0.5, but Layer-1 has
+        already validated that a higher per-ticker cutoff is required for a
+        trade to have positive expected value. Signals that *just* clear
+        that cutoff should receive no bonus; signals that *significantly*
+        exceed it deserve a larger bet.
+
+        Returns a multiplier ≥ 1.0 (never shrinks the position):
+            buy : 1 + alpha * max(0, p - buy_threshold)
+            sell: 1 + alpha * max(0, sell_threshold - p)
+            hold: 1.0
+        """
+        if action == "buy":
+            edge = max(0.0, probability_up - buy_threshold)
+        elif action == "sell":
+            edge = max(0.0, sell_threshold - probability_up)
+        else:
+            return 1.0
+        return 1.0 + alpha * edge
 
     def _compute_prediction_kelly(
         self,
@@ -251,8 +310,35 @@ class RiskAgent:
                 position_size = 0.0
                 reject_reason = "negative_expected_value"
                 risk_flags.append("negative_expected_value")
+            elif self.full_position:
+                # Full-position mode: negative-EV guard above still protects
+                # us; Conformal / tree-dispersion / stop-TP / track-record
+                # filters below remain fully active. We simply skip Kelly
+                # fractional sizing and the conviction boost.
+                position_size = self.max_position_size
+                risk_flags.append("kelly_locked_full")
             else:
-                position_size = kelly_fraction
+                # Probability-conviction scaling (B2): amplify kelly on
+                # signals that meaningfully exceed the Layer-1 threshold.
+                layer1 = forecast.get("layer1_thresholds") or {}
+                buy_th = self._coerce_float(
+                    layer1.get("buy"), default=FALLBACK_BUY_THRESHOLD
+                )
+                sell_th = self._coerce_float(
+                    layer1.get("sell"), default=FALLBACK_SELL_THRESHOLD
+                )
+                prob_conviction = self._compute_probability_conviction(
+                    action=action,
+                    probability_up=probability_up,
+                    buy_threshold=buy_th,
+                    sell_threshold=sell_th,
+                )
+                position_size = min(
+                    kelly_fraction * prob_conviction,
+                    self.max_position_size,
+                )
+                if prob_conviction > 1.0:
+                    risk_flags.append("prob_conviction_boost")
 
                 # ── ③ Uncertainty-aware adjustment ──────────────────────
                 # Conformal prediction set and tree dispersion are two
@@ -284,7 +370,12 @@ class RiskAgent:
         elif action == "sell":
             direction = -1
         else:
-            position_size *= 0.25
+            # action == "hold": no trade at all.
+            # (Previously: position_size *= 0.25 as a "reverse micro-bet",
+            # but this silently re-enabled directions that Layer-1 had
+            # disabled and caused inconsistent behaviour across tickers.
+            # See quant-agents-optimization/update.md.)
+            position_size = 0.0
             if "no_strong_edge" not in risk_flags:
                 risk_flags.append("no_strong_edge")
 
@@ -314,10 +405,22 @@ class RiskAgent:
             reject_reason = reject_reason or "position_too_small"
             risk_flags.append("position_too_small")
 
-        # ── ⑩ Dynamic stop loss ─────────────────────────────────────────
+        # ── ⑩ Dynamic stop loss (volatility-bucket adaptive) ────────────
+        # Bucket the stop-multiplier by annualized vol_20 so high-vol names
+        # (NVDA, TSLA) get wider room to breathe, while low-vol names
+        # (KO, defensive) keep tight stops. Numbers chosen to match the
+        # "give winners room" thesis without hard-coding ticker logic.
         daily_vol = volatility_20 / math.sqrt(252.0)
-        base_stop = daily_vol * 2.5
-        stop_loss_pct = min(0.08, max(0.01, base_stop))
+        if volatility_20 >= 0.35:
+            stop_multiplier = 3.5  # high-vol bucket
+        elif volatility_20 < 0.20:
+            stop_multiplier = 2.0  # low-vol bucket
+        else:
+            stop_multiplier = 2.5  # medium-vol bucket (default)
+        base_stop = daily_vol * stop_multiplier
+        # Upper cap raised from 0.08 -> 0.12 so the high-vol bucket
+        # actually takes effect (otherwise NVDA would be clamped back to 8%).
+        stop_loss_pct = min(0.12, max(0.01, base_stop))
 
         # VIX-based and debt-based stop widening DISABLED.
         # Macro features influence the model probability instead.
@@ -355,6 +458,21 @@ class RiskAgent:
             "kelly_fraction": round(kelly_fraction, 4),
             "regime_state": regime_state,
             "reject_reason": reject_reason,
+            "prob_conviction": round(
+                self._compute_probability_conviction(
+                    action=action,
+                    probability_up=probability_up,
+                    buy_threshold=self._coerce_float(
+                        (forecast.get("layer1_thresholds") or {}).get("buy"),
+                        default=FALLBACK_BUY_THRESHOLD,
+                    ),
+                    sell_threshold=self._coerce_float(
+                        (forecast.get("layer1_thresholds") or {}).get("sell"),
+                        default=FALLBACK_SELL_THRESHOLD,
+                    ),
+                ),
+                4,
+            ),
         }
 
         summary = (

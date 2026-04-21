@@ -1211,6 +1211,55 @@ def fit_isotonic_calibrator(
     return calibrator
 
 
+def fit_real_isotonic_calibrator(
+    oof_predictions: np.ndarray,
+    y: np.ndarray,
+    verbose: bool = True,
+) -> Optional[IsotonicRegression]:
+    """Fit a real sklearn IsotonicRegression calibrator from OOF predictions.
+
+    Unlike Temperature Scaling (which only learns 1 parameter and preserves
+    monotonic structure), Isotonic Regression is a **non-parametric**
+    monotonic fit — it can collapse or even invert mis-calibrated bins
+    (e.g. raw_prob=0.82 → actual_up=28% will be pulled down hard).
+
+    Properties:
+    - Non-parametric: much more flexible than Temperature Scaling
+    - Monotonic (non-decreasing): preserves ranking; IC is invariant
+    - `out_of_bounds='clip'`: safe extrapolation on OOS probabilities
+    - Output clipped to [0.02, 0.98] to avoid hard 0/1 probabilities
+
+    Risk: with only ~1000 OOF samples per walk-forward window, bins at
+    extreme probabilities (>0.8 or <0.2) may have few samples → stair-step
+    overfitting. That is exactly what Temperature Scaling was designed to
+    avoid, so Isotonic should be benchmarked carefully OOS.
+    """
+    valid_mask = ~np.isnan(oof_predictions)
+    n_valid = valid_mask.sum()
+    if n_valid < 50:
+        if verbose:
+            print(f"  [warn] Only {n_valid} valid OOF predictions, skipping isotonic calibration")
+        return None
+
+    raw = oof_predictions[valid_mask]
+    labels = y[valid_mask]
+
+    calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.02, y_max=0.98)
+    calibrator.fit(raw, labels)
+
+    if verbose:
+        cal = calibrator.predict(raw)
+        print(f"  [Isotonic] Fitted on {n_valid} OOF samples")
+        print(f"    Raw prob range:        [{raw.min():.4f}, {raw.max():.4f}]")
+        print(f"    Calibrated prob range: [{cal.min():.4f}, {cal.max():.4f}]")
+        print(f"    Raw mean: {raw.mean():.4f} → Calibrated mean: {cal.mean():.4f}")
+        test_extremes = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+        extreme_cal = calibrator.predict(test_extremes)
+        print(f"    Extrapolation check: {dict(zip(test_extremes.round(1), extreme_cal.round(4)))}")
+
+    return calibrator
+
+
 def compute_conformal_scores(
     oof_predictions: np.ndarray,
     y: np.ndarray,

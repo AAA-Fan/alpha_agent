@@ -765,10 +765,16 @@ def analyze_ic(df: pd.DataFrame, ticker: str) -> dict:
     # Clean up temporary columns
     df.drop(columns=["_month", "_norm_prob", "_month_median", "predicted_direction_fixed"], errors="ignore", inplace=True)
 
+    label_type_str = "excess_return (stock - SPY)"
+    if "stock_5d_return" in df.columns and "spy_5d_return" in df.columns:
+        # Detect whether the caller used absolute returns (spy_5d_return all zero)
+        if (df["spy_5d_return"].abs() < 1e-12).all():
+            label_type_str = "absolute_return (raw stock return)"
+
     results = {
         "ticker": ticker,
         "n_samples": len(df),
-        "label_type": "excess_return (stock - SPY)",
+        "label_type": label_type_str,
         # Primary IC metrics (per-month averaged — correct for walk-forward)
         "mean_monthly_ic": round(float(mean_monthly_ic), 6),
         "std_monthly_ic": round(float(std_monthly_ic), 6),
@@ -1002,8 +1008,12 @@ def main():
     parser.add_argument("--train-years", type=int, default=5, help="Rolling training window in years (default: 5)")
     parser.add_argument("--horizon", type=int, default=5, help="Prediction horizon in days (default: 5)")
     parser.add_argument("--cv-folds", type=int, default=5, help="CV folds for training (default: 5)")
+    parser.add_argument("--label", type=str, default="excess", choices=["excess", "absolute"],
+                        help="Label type: 'excess' = stock - SPY (default), 'absolute' = raw stock return (aligns with stage3)")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
+
+    use_excess = args.label == "excess"
 
     ticker = args.ticker.strip().upper()
     start_date = pd.Timestamp(args.start)
@@ -1043,16 +1053,20 @@ def main():
         print(f"[ERROR] No data available for {ticker}")
         sys.exit(1)
 
-    # Download SPY for excess return labels
+    # Download SPY (always needed for beta feature; may or may not be used as label)
     spy_data_dict = download_training_data(["SPY"])
-    spy_data = spy_data_dict.get("SPY")
-    if spy_data is not None and not spy_data.empty:
-        print(f"  SPY data: {len(spy_data)} rows")
-        spy_close = pd.to_numeric(spy_data["Close"], errors="coerce")
+    spy_raw = spy_data_dict.get("SPY")
+    if spy_raw is not None and not spy_raw.empty:
+        print(f"  SPY data: {len(spy_raw)} rows")
+        spy_close = pd.to_numeric(spy_raw["Close"], errors="coerce")
     else:
-        print("  [warn] SPY data not available, will use absolute return labels")
-        spy_data = None
+        print("  [warn] SPY data not available")
+        spy_raw = None
         spy_close = None
+
+    # Label switch: pass spy_data to build_labels only in excess mode
+    spy_data = spy_raw if use_excess else None
+    print(f"  Label type: {'excess_return (stock - SPY)' if use_excess else 'absolute_return (raw stock return)'}")
 
     ohlcv_data = raw_data[ticker]
     if not isinstance(ohlcv_data.index, pd.DatetimeIndex):
@@ -1202,7 +1216,7 @@ def main():
             lgb_model=lgb_model,
             meta=meta,
             ohlcv_data=ohlcv_data,
-            spy_close=spy_close,
+            spy_close=spy_close if use_excess else None,
             macro_fund_df=macro_fund_df,
             month_start=month_start,
             month_end=month_end,

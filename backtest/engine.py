@@ -531,14 +531,24 @@ class BacktestEngine:
         start_date: str,
         end_date: str,
         warmup_days: int = 60,
+        entry_cutoff_date: Optional[str] = None,
     ) -> BacktestResult:
         """Execute walk-forward backtest.
 
         Args:
             ticker: Stock symbol.
             start_date: Backtest start date (YYYY-MM-DD).
-            end_date: Backtest end date (YYYY-MM-DD).
+            end_date: Backtest end date (YYYY-MM-DD). Historical data / exit
+                prices are loaded up to this date (inclusive). Callers should
+                pass `month_end + horizon_days + buffer` when running monthly
+                slices so positions opened near month-end can still reach a
+                natural horizon exit without being truncated.
             warmup_days: Number of days reserved for feature calculation warmup.
+            entry_cutoff_date: Last date (YYYY-MM-DD) on which a *new* entry
+                may be opened. If None, defaults to `end_date`. Used by the
+                walk-forward orchestrator to restrict entries to the
+                prediction month while still allowing positions to exit on
+                days that fall in the following month's data buffer.
 
         Returns:
             BacktestResult with trade log, equity curve, and benchmark.
@@ -577,9 +587,14 @@ class BacktestEngine:
         start_idx = max(start_idx, warmup_days)
         total_days = len(dates)
 
+        # Resolve entry cutoff (new entries may only open on dates <= cutoff).
+        # Defaults to end_date when the caller does not supply one.
+        cutoff_ts = pd.Timestamp(entry_cutoff_date) if entry_cutoff_date else pd.Timestamp(end_date)
+
         self._log(
             f"[backtest] {ticker}: {total_days} total bars, "
-            f"stepping from idx={start_idx} with horizon={self.horizon_days}"
+            f"stepping from idx={start_idx} with horizon={self.horizon_days}, "
+            f"entry_cutoff={cutoff_ts.strftime('%Y-%m-%d')}"
         )
 
         # Initialize macro snapshots (historical time-varying data)
@@ -599,11 +614,21 @@ class BacktestEngine:
         trade_log: List[Dict[str, Any]] = []
         step_count = 0
 
-        # Walk-forward loop
+        # Walk-forward loop — step = horizon_days on executed/rejected bars,
+        # step = 1 when an agent fails. This matches the Stage3 debug loop
+        # (t += horizon after each evaluation) so the sampling cadence is
+        # identical between debug and production runs.
         t = start_idx
         while t < total_days:
-            step_count += 1
             current_date = dates[t]
+
+            # Stop evaluating once we pass the entry cutoff. Any position
+            # already opened before the cutoff is allowed to exit using the
+            # full-range data window the caller provided.
+            if current_date > cutoff_ts:
+                break
+
+            step_count += 1
 
             if self.verbose and step_count % 10 == 0:
                 self._log(
@@ -746,7 +771,8 @@ class BacktestEngine:
                 }
                 trade_log.append(trade)
 
-            # Step forward by horizon
+            # Advance by horizon_days to mirror Stage3 debug sampling and
+            # keep holding periods non-overlapping by construction.
             t += self.horizon_days
 
         self._log(
